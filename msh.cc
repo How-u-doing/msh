@@ -443,7 +443,8 @@ pid_t run_command(Command* cmd, pid_t pgid)
         if (cmd->errfd != 2) { // 2>, redirect stderr to a file
                                // 2>&1, redirect stderr to stdout (&1, fd 1)
             dup2(cmd->errfd, STDERR_FILENO);
-            close(cmd->errfd);
+            if (cmd->errfd != 1)
+                close(cmd->errfd);
         }
 
         // run a built-in command or execvp one
