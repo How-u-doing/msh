@@ -1,12 +1,11 @@
-// using sh61's parsing facility, etc. to make life easier
+// using sh61's parsing facility & claim_foreground to make life easier
 #include "sh61.hh"
-#include <iterator>
-#include <stdexcept>
 #include <string>
 #include <vector>
 #include <utility>
 #include <map>
 #include <iostream>
+#include <iomanip>
 #include <cstring>
 #include <climits>
 #include <cassert>
@@ -29,6 +28,10 @@ using namespace std;
 #define REDIRECT_OP_APPEND  3   // >>
 #define REDIRECT_OP_ERRAPP  4   // 2>>
 
+#define RUNNING    0
+#define STOPPED    1
+#define COMPLETED  2
+
 // a simple command, e.g. grep test > tmp (<) Makefile
 struct Command {
     string str; // the command string
@@ -40,10 +43,7 @@ struct Command {
     int errfd = 2;
     pid_t pid = -1;
     int op = TYPE_SEQUENCE;  // operator type the cmd ends with
-    int status = 0;          // return status
-    // !completed && !stopped => running
-    bool completed = false;
-    bool stopped = false;
+    int state = RUNNING;
 };
 
 // a list of simple commands joined by | and/or |& (2>&1 |)
@@ -56,6 +56,7 @@ struct Pipeline {
     Command* first_cmd = nullptr;
     Pipeline* next = nullptr;
     pid_t pgid = -1;
+    int state = RUNNING;
     bool notified = false;
     bool foreground = true;
     bool next_is_or = false; // || or && (valid when `last == false`)
@@ -65,12 +66,33 @@ struct Pipeline {
     // it's not (can be told from whether `next == nullptr`).
 };
 
+typedef Command process;
 typedef Pipeline job;
 
-job* current_foreground_job = nullptr;
-int last_job_exit_status = 0;
-map<pid_t, job*> job_list;
-map<int, job*> stopped_jobs;
+#define EVENT_JOB_DONE   0
+#define EVENT_JOB_TERM  -1
+#define EVENT_JOB_STOP  -2
+#define EVENT_JOB_CONT  -3
+
+// job state-changing indicator; PRESET a value before using it
+volatile sig_atomic_t event_pid = 1; // > 0 when waiting a child succeed
+                                     // ==0 when any job is completed
+                                     // < 0 when any job is signalled
+                                     // (STOP, CONT, TERM, etc.)
+bool shell_owns_foreground = false;
+job* current_fg_job = nullptr;
+
+int last_executed_job_status = 0;  // value of $?, and for conditionals,
+                                   // whether to do the job after || or &&
+
+// The following three job-control lists are crucial for the shell to preform
+// job controlling, please make sure you block undesired signals before you
+// manipulate them.
+map<pid_t, process*> process_list; // to quickly find a process and set state
+map<pid_t, job*> job_list;         // to quickly find a job when given a pgid
+// job-control id starts from `rend()->first + 1`
+map<int, job*> stopped_or_bg_jobs;
+
 
 #if 1 // for completeness, though we won't use them here
 
@@ -91,6 +113,58 @@ struct List {
 };
 
 #endif
+
+
+const char* state_strings[3] = { "Running", "Stopped", "Done" };
+
+pid_t last_process_in_job(job* j)
+{
+    for (process* p = j->first_cmd; p; p = p->next) {
+        if (!p->next)
+            return p->pid;
+    }
+    return 0; // not found
+}
+
+int find_job_in_stopped_or_bg_jobs(job* j)
+{
+    for (const auto& x : stopped_or_bg_jobs) {
+        if (x.second == j)
+            return x.first;
+    }
+    return 0; // not found
+}
+
+// find the job that has a child process with `pid`
+job* find_job(pid_t pid)
+{
+    for (const auto& j : job_list) {
+        for (process* p = j.second->first_cmd; p; p = p->next) {
+            if (p->pid == pid)
+                return j.second;
+        }
+    }
+    return nullptr;
+}
+
+// do all processes in job `j` have either completed or stopped
+bool job_stopped(job* j)
+{
+    for (process* p = j->first_cmd; p; p = p->next) {
+        if (p->state != COMPLETED && p->state != STOPPED)
+            return false;
+    }
+    return true;
+}
+
+bool job_completed(job* j)
+{
+    for (process* p = j->first_cmd; p; p = p->next) {
+        if (p->state != COMPLETED)
+            return false;
+    }
+    return true;
+}
 
 // is the conditional chain starting at `cmd` run in the background
 bool chain_in_background(Command* cmd)
@@ -163,7 +237,7 @@ void print_prompt()
     cout.flush();
 }
 
-void release_list_of_cmds(Command* cmd)
+void release_cmds(Command* cmd)
 {
     Command* del;
     while (cmd) {
@@ -173,16 +247,30 @@ void release_list_of_cmds(Command* cmd)
     }
 }
 
-// release resources (list of jobs) created in `parse_line`
-void release_list_of_jobs(job* j)
+// for command line paring if on error
+void release_cmdline(Command* cmd)
 {
-    job* del;
-    while (j) {
-        del = j;
-        j = j->next;
-        release_list_of_cmds(del->first_cmd);
-        delete del;
+    release_cmds(cmd);
+}
+
+// used when a job is completed or for cleaning on shell exiting
+auto delete_job(job* j)
+{
+    for (process* p = j->first_cmd; p; p = p->next) {
+        process_list.erase(p->pid);
     }
+    release_cmds(j->first_cmd);
+
+    int job_index = find_job_in_stopped_or_bg_jobs(j);
+    if (job_index != 0) {
+        stopped_or_bg_jobs.erase(job_index);
+    }
+
+    auto it = job_list.find(j->pgid);
+    assert(it != job_list.end());
+    auto next = job_list.erase(it);
+    delete j;
+    return next;
 }
 
 void msh_error(const char* msg)
@@ -229,7 +317,7 @@ job* parse_line(const char* s)
             if (op == "<") {
                 if (it.type() != TYPE_NORMAL) {
                     msh_error("expected an input file after <");
-                    release_list_of_cmds(chead);
+                    release_cmdline(chead);
                     return nullptr;
                 }
                 ccur->redirections.emplace_back(REDIRECT_OP_INPUT, it.str());
@@ -238,7 +326,7 @@ job* parse_line(const char* s)
                 if (it.type() != TYPE_NORMAL) {
                     string msg = "expected an output file after " + op;
                     msh_error(msg.c_str());
-                    release_list_of_cmds(chead);
+                    release_cmdline(chead);
                     return nullptr;
                 }
                 // > outfile 2>&1  <==>  &> outfile
@@ -250,7 +338,7 @@ job* parse_line(const char* s)
             else if (op == "2>") {
                 if (it.type() != TYPE_NORMAL) {
                     msh_error("expected an output file for stderr after 2>");
-                    release_list_of_cmds(chead);
+                    release_cmdline(chead);
                     return nullptr;
                 }
                 ccur->redirections.emplace_back(REDIRECT_OP_ERROUT, it.str());
@@ -260,7 +348,7 @@ job* parse_line(const char* s)
                 if (it.type() != TYPE_NORMAL) {
                     string msg = "expected an output file for appending after " + op;
                     msh_error(msg.c_str());
-                    release_list_of_cmds(chead);
+                    release_cmdline(chead);
                     return nullptr;
                 }
                 if (op == "&>>" || op == ">>&")
@@ -270,7 +358,7 @@ job* parse_line(const char* s)
             else if (op == "2>>") {
                 if (it.type() != TYPE_NORMAL) {
                     msh_error("expected an output file for appending stderr after 2>>");
-                    release_list_of_cmds(chead);
+                    release_cmdline(chead);
                     return nullptr;
                 }
                 ccur->redirections.emplace_back(REDIRECT_OP_ERRAPP, it.str());
@@ -286,7 +374,7 @@ job* parse_line(const char* s)
             if (!ccur) {
                 string msg = "syntax error near unexpected token " + it.str();
                 msh_error(msg.c_str());
-                release_list_of_cmds(chead);
+                release_cmdline(chead);
                 return nullptr;
             }
             if (it.type() == TYPE_PIPE && it.str() == "|&")
@@ -346,19 +434,211 @@ job* parse_line(const char* s)
     return jhead;
 }
 
-// `getconf ARG_MAX` on my machine gives 2'097'152 (scary)
-#define MAX_ARGS 32767 // 2^15 - 1
-
-// spawn a child process to run `cmd`
-pid_t run_command(Command* cmd, pid_t pgid)
+// block all signals and save current sigset to oldset if it isn't null
+// used when we are entering a critical region/section
+void block_all_signals(sigset_t* oldset)
 {
-    static const char* argv[MAX_ARGS];
-    assert(cmd->args.size() > 0 && cmd->args.size() < MAX_ARGS);
+    sigset_t mask;
+    sigfillset(&mask);
+    sigprocmask(SIG_BLOCK, &mask, oldset);
+}
 
+void block_chld_signal(sigset_t* oldset)
+{
+    sigset_t mask;
+    sigaddset(&mask, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &mask, oldset);
+}
+
+void unblock_chld_signal()
+{
+    sigset_t mask;
+    sigaddset(&mask, SIGCHLD);
+    sigprocmask(SIG_UNBLOCK, &mask, nullptr);
+}
+
+int get_job_index(job* j)
+{
+    for (const auto& x: stopped_or_bg_jobs) {
+        if (x.second == j)
+            return x.first;
+    }
+    return 0; // not found
+}
+
+void format_job_info(int job_index, job* j)
+{
+    cout << '[' << job_index << ']' << '\t'
+         << std::left << std::setfill(' ')
+         << std::setw(11) << j->pgid
+         << std::setw(13) << state_strings[j->state]
+         << j->str << endl;
+}
+
+void delete_completed_jobs()
+{
+    for (auto it = job_list.begin(); it != job_list.end(); ) {
+        if (it->second->state == COMPLETED)
+            it = delete_job(it->second);
+        else
+            ++it;
+    }
+}
+
+void jobs()
+{
+    sigset_t oldset;
+    block_all_signals(&oldset);
+    for (const auto& j : stopped_or_bg_jobs) {
+        format_job_info(j.first, j.second);
+    }
+    delete_completed_jobs();
+    sigprocmask(SIG_SETMASK, &oldset, nullptr);
+}
+
+void wait_for_job(job* j, sigset_t* oldset)
+{
+    event_pid = 1;
+    // Note that event_pid != EVENT_JOB_DONE does not necessarily mean the job
+    // is finished, it just means some job has done (maybe not this job `j`)
+    while (j->state != COMPLETED &&
+           event_pid != EVENT_JOB_STOP &&
+           event_pid != EVENT_JOB_TERM)
+        sigsuspend(oldset);
+}
+
+void fg(int job_index)
+{
+    sigset_t oldset;
+    block_all_signals(&oldset);
+    delete_completed_jobs();
+    sigprocmask(SIG_SETMASK, &oldset, nullptr);
+
+    block_chld_signal(&oldset);
+    if (stopped_or_bg_jobs.count(job_index) == 1) {
+        current_fg_job = stopped_or_bg_jobs[job_index];
+        cout << current_fg_job->str << endl;
+        pid_t pgid = current_fg_job->pgid;
+        kill(- pgid, SIGCONT);
+
+        claim_foreground(pgid);
+        wait_for_job(current_fg_job, &oldset);
+        claim_foreground(0);
+
+        current_fg_job = nullptr;
+    }
+    else {
+        string msg = "fg: %" + to_string(job_index) + ": no such job";
+        msh_error(msg.c_str());
+    }
+    sigprocmask(SIG_SETMASK, &oldset, nullptr);
+}
+
+void bg(int job_index)
+{
+    sigset_t oldset;
+    block_all_signals(&oldset);
+    delete_completed_jobs();
+    if (stopped_or_bg_jobs.count(job_index) == 1) {
+        pid_t pgid = stopped_or_bg_jobs[job_index]->pgid;
+        kill(- pgid, SIGCONT);
+    }
+    else {
+        string msg = "fg: %" + to_string(job_index) + ": no such job";
+        msh_error(msg.c_str());
+    }
+    sigprocmask(SIG_SETMASK, &oldset, nullptr);
+}
+
+// true if there're no stopped jobs or already being notified
+// if it's true, also clean resources
+bool can_exit()
+{
+    // block signals to prevent sigchld handler from changing
+    // the job-control lists and freeing jobs too
+    sigset_t oldset;
+    block_all_signals(&oldset);
+
+    static bool stopped_jobs_notified = false;
+    bool has_stopped_jobs = false;
+    for (const auto& j : stopped_or_bg_jobs) {
+        if (j.second->state == STOPPED) {
+            has_stopped_jobs = true;
+            break;
+        }
+    }
+    if (has_stopped_jobs && !stopped_jobs_notified) {
+        msh_error("There are stopped jobs");
+        stopped_jobs_notified = true;
+        // restore old signals if can not exit yet
+        sigprocmask(SIG_SETMASK, &oldset, nullptr);
+        last_executed_job_status = EXIT_FAILURE;
+        return false;
+    }
+    for (auto it = job_list.begin(); it != job_list.end(); ) {
+        if (it->second->state == COMPLETED)
+            kill(- it->second->pgid, SIGKILL);
+        it = delete_job(it->second);
+    }
+    return true;
+}
+
+void set_up_redirections(Command* cmd)
+{
+    // open redirection files if any
+    for (const auto& x : cmd->redirections) {
+        // O_CLOEXEC flag permits a program to avoid additional
+        // fcntl(2) F_SETFD operations to set the FD_CLOEXEC flag.
+        int flags = cmd->pid == 0 ? 0 : O_CLOEXEC;
+        if (x.first == REDIRECT_OP_INPUT)
+            flags |= O_RDONLY;
+        else if (x.first == REDIRECT_OP_OUTPUT || x.first == REDIRECT_OP_ERROUT)
+            flags |= O_CREAT | O_WRONLY | O_TRUNC;
+        else if (x.first == REDIRECT_OP_APPEND || x.first == REDIRECT_OP_ERRAPP)
+            flags |= O_CREAT | O_APPEND | O_WRONLY;
+
+        int fd = open(x.second.c_str(), flags, /* mode: rw-r--r-- */0644);
+        if (fd == -1) {
+            perror("open");
+            // only exit in child processes if `open` failed
+            if (cmd->pid > 0)
+                _exit(EXIT_FAILURE);
+        }
+
+        // redirect
+        if (x.first == REDIRECT_OP_INPUT)
+            cmd->infd = fd;
+        else if (x.first == REDIRECT_OP_OUTPUT || x.first == REDIRECT_OP_APPEND)
+            cmd->outfd = fd;
+        else if (x.first == REDIRECT_OP_ERROUT || x.first == REDIRECT_OP_ERRAPP)
+            cmd->errfd = fd;
+    }
+
+    // set up redirections if any
+    if (cmd->infd != 0) {  // <, redirect a file to stdin
+        dup2(cmd->infd, STDIN_FILENO);
+        close(cmd->infd);
+    }
+    if (cmd->outfd != 1) { // >, redirect stdout to a file
+        dup2(cmd->outfd, STDOUT_FILENO);
+        close(cmd->outfd);
+    }
+    if (cmd->errfd != 2) { // 2>, redirect stderr to a file
+                           // 2>&1, redirect stderr to stdout (&1, fd 1)
+        dup2(cmd->errfd, STDERR_FILENO);
+        if (cmd->errfd != 1)
+            close(cmd->errfd);
+    }
+}
+
+// return 0 if it's a built-in command that doesn't need to fork
+// otherwise, -1 is returned
+pid_t run_built_in_cmd(Command* cmd)
+{
     const string& cmd_name = cmd->args[0];
     if (cmd_name == "exit") {
-        // if has any stopped/running jobs, terminate them
-        // ... to kill unfinished jobs
+        if (!can_exit())
+            return 0; // cannot exit yet this time
         if (cmd->args.size() == 1)
             exit(EXIT_SUCCESS);
         else {
@@ -380,16 +660,96 @@ pid_t run_command(Command* cmd, pid_t pgid)
             exit(exit_code);
         }
     }
-    // this is the only command the shell doesn't fork to run
     if (cmd_name == "cd") {
         string path = cmd->args.size() == 1 ? "~" : cmd->args[1];
         cd(path);
-        return cmd->pid = 0; // represents parent (no forking)
+        return cmd->pid = 0;
+    }
+    else if (cmd_name == "jobs") {
+        // jobs > job_list.txt
+        cmd->pid = 0;
+        // Redirections for built-in commands require us to make backups for
+        // stdin/out/err, and then copy them back.
+        int saved_infd  = dup(0);
+        int saved_outfd = dup(1);
+        int saved_errfd = dup(2);
+
+        set_up_redirections(cmd);
+        jobs();
+
+        // copy back
+        if (cmd->infd != 0)
+            dup2(saved_infd, 0);
+        if (cmd->outfd != 1)
+            dup2(saved_outfd, 1);
+        if (cmd->errfd != 2)
+            dup2(saved_errfd, 2);
+        close(saved_infd);
+        close(saved_outfd);
+        close(saved_errfd);
+
+        return 0;
+    }
+    else if (cmd_name == "fg" || cmd_name == "bg") {
+        // `fg` needs the original sigset to support `sigsuspend`
+        unblock_chld_signal();
+        int job_index = 0;
+        if (cmd->args.size() < 2) {
+            if (stopped_or_bg_jobs.empty()) {
+                string msg = cmd_name + ": no jobs";
+                msh_error(msg.c_str());
+                return cmd->pid = 0;
+            }
+            job_index = stopped_or_bg_jobs.rend()->first;
+        }
+        else {
+            string index = &cmd->args[1][1];
+            try {
+                job_index = stoi(index);
+            }
+            catch (...) {
+                string msg = cmd_name + ": %" + index + ": no such job";
+                msh_error(msg.c_str());
+                return cmd->pid = 0;
+            }
+        }
+
+        if (cmd_name == "fg")
+            fg(job_index);
+        else if (cmd_name == "bg")
+            bg(job_index);
+
+        return cmd->pid = 0;
+    }
+    return -1;
+}
+
+// `getconf ARG_MAX` on my machine gives 2'097'152 (scary)
+#define MAX_ARGS 32767 // 2^15 - 1
+
+// spawn a child process to run `cmd`
+// only a handful of built-in commands don't need to fork to run
+pid_t run_command(Command* cmd, pid_t pgid, bool foreground)
+{
+    static const char* argv[MAX_ARGS];
+    assert(cmd->args.size() > 0 && cmd->args.size() < MAX_ARGS);
+
+    pid_t id = run_built_in_cmd(cmd);
+    if (id == 0) // doesn't need to fork to run
+        return 0;
+
+    const string& cmd_name = cmd->args[0];
+
+    // substitute $?
+    if (cmd_name == "echo" && cmd->args.size() >= 2 && cmd->args[1] == "$?") {
+        cmd->args[1] = to_string(last_executed_job_status);
     }
 
+    // set up argv for execvp
     for (size_t i = 0; i < cmd->args.size(); ++i)
         argv[i] = cmd->args[i].c_str();
     argv[cmd->args.size()] = nullptr;
+
     // optional, make ls print with color by default
     if (cmd_name == "ls") {
         argv[cmd->args.size()] = "--color";
@@ -401,61 +761,31 @@ pid_t run_command(Command* cmd, pid_t pgid)
         handle_error("fork");
     }
     else if (pid == 0) { // child
-        cmd->pid = getpid();
-        if (pgid == -1) // not set yet
-            pgid = cmd->pid;
-        setpgid(cmd->pid, pgid);
+        // since we blocked SIGCHLD in parent (subshells, etc. need it)
+        unblock_chld_signal();
 
-        // open redirection files if any
-        for (const auto& x : cmd->redirections) {
-            // O_CLOEXEC flag permits a program to avoid additional
-            // fcntl(2) F_SETFD operations to set the FD_CLOEXEC flag.
-            int flags = O_CLOEXEC;
-            if (x.first == REDIRECT_OP_INPUT)
-                flags |= O_RDONLY;
-            else if (x.first == REDIRECT_OP_OUTPUT || x.first == REDIRECT_OP_ERROUT)
-                flags |= O_CREAT | O_WRONLY | O_TRUNC;
-            else if (x.first == REDIRECT_OP_APPEND || x.first == REDIRECT_OP_ERRAPP)
-                flags |= O_CREAT | O_APPEND | O_WRONLY;
+        if (shell_owns_foreground) {
+            cmd->pid = getpid();
+            if (pgid == -1) // not set yet
+                pgid = cmd->pid;
+            setpgid(cmd->pid, pgid);
+            if (foreground)
+                claim_foreground(pgid);
 
-            int fd = open(x.second.c_str(), flags, /* mode: rw-r--r-- */0644);
-            if (fd == -1)
-                handle_error("open");
-
-            // redirect
-            if (x.first == REDIRECT_OP_INPUT)
-                cmd->infd = fd;
-            else if (x.first == REDIRECT_OP_OUTPUT || x.first == REDIRECT_OP_APPEND)
-                cmd->outfd = fd;
-            else if (x.first == REDIRECT_OP_ERROUT || x.first == REDIRECT_OP_ERRAPP)
-                cmd->errfd = fd;
+            // reset job-control & interactive signals to default for children
+            signal(SIGCHLD, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGTTIN, SIG_DFL);
+            signal(SIGTTOU, SIG_DFL);
+            signal(SIGINT, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
         }
 
-        // set up redirections if any
-        if (cmd->infd != 0) {  // <, redirect a file to stdin
-            dup2(cmd->infd, STDIN_FILENO);
-            close(cmd->infd);
-        }
-        if (cmd->outfd != 1) { // >, redirect stdout to a file
-            dup2(cmd->outfd, STDOUT_FILENO);
-            close(cmd->outfd);
-        }
-        if (cmd->errfd != 2) { // 2>, redirect stderr to a file
-                               // 2>&1, redirect stderr to stdout (&1, fd 1)
-            dup2(cmd->errfd, STDERR_FILENO);
-            if (cmd->errfd != 1)
-                close(cmd->errfd);
-        }
+        set_up_redirections(cmd);
 
-        // run a built-in command or execvp one
+        // run a forked built-in command or execvp one
         if (cmd_name == "pwd") {
             pwd();
-        }
-        else if (cmd_name == "jobs") {
-        }
-        else if (cmd_name == "bg") {
-        }
-        else if (cmd_name == "bg") {
         }
         else if (cmd_name == "history") {
         }
@@ -476,22 +806,25 @@ void run_pipeline(Pipeline* pipeline)
     // |& form (e.g. a |& b or a 2>&1 | b) will be preprocessed in the parsing
     // phase by setting errfd = 1 (instead of stderr, 2) which then will be
     // redirected to stdout which will be redirected to some file descriptor.
+    sigset_t oldset;
+    block_chld_signal(&oldset);
+
     int pipefd[2]{-1, -1}, prev_pipe_read_end = 0;
     for (Command* cmd = pipeline->first_cmd; cmd; cmd = cmd->next) {
         // pipe2 with O_CLOEXEC flag can close the file descriptors created by
         // pipe2 automatically in the child processes when they call execvp
         // (although closing them isn't an error). Using it enables us to only
         // focus on the file descriptors created in the parent process.
-        if (pipe2(pipefd, O_CLOEXEC) == -1)
-            handle_error("pipe2");
         if (cmd->next) {
+            if (pipe2(pipefd, O_CLOEXEC) == -1)
+                handle_error("pipe2");
             cmd->outfd = pipefd[1];
             cmd->next->infd = pipefd[0];
         }
-        run_command(cmd, pipeline->pgid);
+        run_command(cmd, pipeline->pgid, pipeline->foreground);
         // add all child processes in pipeline to the same process group
-        /* Note that here are race conditions (child processes may exit or
-         * become zombies before parent setpgid).
+        /* Note that here are race conditions (child processes may `execvp`
+         * before parent `setpgid` or may not; ditto `claim_foreground`).
          * """
          * In order to avoid some race conditions, you should call setpgid in
          * the parent and in each of the children. Why does the parent need to
@@ -504,59 +837,53 @@ void run_pipeline(Pipeline* pipeline)
          * """ (quoted from the Stanford Shell "Tips and Tidbits" section)
          * https://web.stanford.edu/class/cs110/summer-2021/assignments/assign4-stanford-shell/
          */
-        if (pipeline->pgid == -1 && cmd->pid != 0) // ignore leading `cd`
-            pipeline->pgid = cmd->pid;
-        if (cmd->pid != 0)
-            setpgid(cmd->pid, pipeline->pgid);
+        if (shell_owns_foreground) {
+            if (pipeline->pgid == -1 && cmd->pid != 0)
+                pipeline->pgid = cmd->pid;
+            if (cmd->pid != 0) {
+                setpgid(cmd->pid, pipeline->pgid);
+                process_list[cmd->pid] = cmd;
+            }
+        }
         // Draw pictures!
         // Parent closes current pipe's write end & previous pipe's read end.
         // There are a collection of great drawings in Harvard SEAS School's
         // CS61 course site. They clearly demonstrate how piping works in a
         // step-by-step fashion. Please see the subsection "Pipe in a shell"
         // in https://cs61.seas.harvard.edu/site/2021/ProcessControl/.
-        close(pipefd[1]);
+        if (cmd->next)
+            close(pipefd[1]);
         if (prev_pipe_read_end != 0)
             close(prev_pipe_read_end);
         prev_pipe_read_end = pipefd[0];
     }
-    if (pipefd[0] != -1)
-        close(pipefd[0]); // close last pipe read end
 
-    if (pipeline->pgid == -1) { // job with only `cd` command
-        last_job_exit_status = 0;
+    if (pipeline->pgid == -1) { // job without child processes
+        sigprocmask(SIG_SETMASK, &oldset, nullptr);
         return;
     }
-    if (pipeline->foreground) {
-        current_foreground_job = pipeline;
-        int wstatus;
-        while (waitpid(-pipeline->pgid, &wstatus, WUNTRACED | WCONTINUED) > 0);
-#if 0
-        int w = 1;
-        while (w > 0) {
-            do {
-                w = waitpid(-pipeline->pgid, &pipeline->wstatus, WUNTRACED | WCONTINUED);
-                if (w == -1 && errno != ECHILD)
-                    handle_error("waitpid");
 
-                if (WIFEXITED(pipeline->wstatus))
-                    /* normal exit */
-                    last_job_exit_status = WEXITSTATUS(pipeline->wstatus);
-                else if (WIFSIGNALED(pipeline->wstatus))
-                    /* type Ctrl+C while the shell is executing a foreground pipeline */
-                    last_job_exit_status = WTERMSIG(pipeline->wstatus);
-                else if (WIFSTOPPED(pipeline->wstatus))
-                    /* type Ctrl+Z while the shell is executing a foreground pipeline */
-                    last_job_exit_status = WSTOPSIG(pipeline->wstatus);
-                else if (WIFCONTINUED(pipeline->wstatus))
-                    /* `fg` sends SIGCONT signal to the stopped process */
-                    (void) 1;
-            } while (!WIFEXITED(pipeline->wstatus) && !WIFSIGNALED(pipeline->wstatus));
-        }
-#endif
+    // add job to list
+    job_list[pipeline->pgid] = pipeline;
+
+    if (pipeline->foreground) {
+        current_fg_job = pipeline;
+
+        claim_foreground(pipeline->pgid);
+        wait_for_job(current_fg_job, &oldset);
+        claim_foreground(0);
+
+        current_fg_job = nullptr;
     }
     else { // always return success (0) for background jobs
-        last_job_exit_status = 0;
+        last_executed_job_status = 0;
+        int next = stopped_or_bg_jobs.empty() ?
+                   1 : stopped_or_bg_jobs.cend()->first + 1;
+        stopped_or_bg_jobs[next] = pipeline;
+        cout << '[' << next << ']' << '\t' << pipeline->pgid << endl;
     }
+
+    sigprocmask(SIG_SETMASK, &oldset, nullptr);
 }
 
 void run_list_of_jobs(job* j)
@@ -564,32 +891,158 @@ void run_list_of_jobs(job* j)
     while (j) {
         run_pipeline(j);
         if (!j->last) { // not the last pipeline in a conditional
-            if (j->next_is_or) {
-                //if (last_job_exit_status);
-            }
-            else { // &&
+            sigset_t oldset;
+            block_chld_signal(&oldset);
 
+            wait_for_job(j, &oldset);
+            sigprocmask(SIG_SETMASK, &oldset, nullptr);
+
+            if (j->next_is_or) { // ... job1 || job2
+                if (last_executed_job_status == 0)
+                    j = j->next; // skip job2
+            }
+            else { // ... job1 && job2
+                if (last_executed_job_status != 0)
+                    j = j->next; // skip job2
             }
         }
         j = j->next;
     }
 }
 
+// set uncompleted processes in job `j` with `state`
+void set_job_state(job* j, int state)
+{
+    for (process* p = j->first_cmd; p; p = p->next) {
+        if (p->state != COMPLETED)
+            p->state = state;
+    }
+    j->state = state;
+}
+
+void sigchld_handler(int sig)
+{
+    (void) sig;
+    int old_errno = errno;
+    //sigset_t oldset;
+    int wstatus;
+    while ((event_pid = waitpid(-1, &wstatus, WUNTRACED | WCONTINUED)) > 0) {
+        pid_t pid = event_pid; // pid_t cast
+        job* j = find_job(pid);
+        assert(j);
+        if (WIFEXITED(wstatus)) {
+            process_list[pid]->state = COMPLETED;
+            if (pid == last_process_in_job(j)) {
+                last_executed_job_status = WEXITSTATUS(wstatus);
+            }
+            if (job_completed(j)) {
+                j->state = COMPLETED;
+                event_pid = EVENT_JOB_DONE;
+            }
+        }
+        else if (WIFSIGNALED(wstatus)) {
+            delete_job(j);
+            last_executed_job_status = WTERMSIG(wstatus);
+            event_pid = EVENT_JOB_TERM;
+        }
+        else if (WIFSTOPPED(wstatus)) {
+            int job_index = find_job_in_stopped_or_bg_jobs(j);
+            if (job_index == 0) { // not found
+                job_index = stopped_or_bg_jobs.empty() ?
+                            1 : stopped_or_bg_jobs.cend()->first + 1;
+                stopped_or_bg_jobs[job_index] = j;
+            }
+            set_job_state(j, STOPPED);
+            last_executed_job_status = WSTOPSIG(wstatus);
+            event_pid = EVENT_JOB_STOP;
+        }
+        else if (WIFCONTINUED(wstatus)) {
+            set_job_state(j, RUNNING);
+            event_pid = EVENT_JOB_CONT;
+        }
+
+        if (event_pid <= 0)
+            break;
+    }
+    errno = old_errno;
+}
+
 void sigint_handler(int sig)
 {
     (void) sig;
-    if (current_foreground_job) {
-        kill(- current_foreground_job->pgid, SIGKILL);
-        // discard the remaining jobs also
-        release_list_of_jobs(current_foreground_job);
-        current_foreground_job->next = nullptr;
+    int old_errno = errno;
+    if (current_fg_job) {
+        // not necessarily kills it, e.g. vim, emacs, etc.
+        kill(- current_fg_job->pgid, SIGINT);
     }
+    else {
+        cout << '\n';
+        print_prompt();
+    }
+    errno = old_errno;
+}
+
+void sigtstp_handler(int sig)
+{
+    (void) sig;
+    int old_errno = errno;
+    if (current_fg_job) {
+        kill(- current_fg_job->pgid, SIGTSTP);
+    }
+    errno = old_errno;
+}
+
+// claim_foreground(pgid)
+//    Mark `pgid` as the current foreground process group for this terminal.
+//    This uses some ugly Unix warts, so we provide it for you.
+int claim_foreground(pid_t pgid)
+{
+    // YOU DO NOT NEED TO UNDERSTAND THIS.
+
+    // Initialize state first time we're called.
+    static int ttyfd = -1;
+    static pid_t shell_pgid = -1;
+    if (ttyfd < 0) { // initialize the shell
+        // We need a fd for the current terminal, so open /dev/tty.
+        int fd = open("/dev/tty", O_RDWR);
+        assert(fd >= 0);
+        // Re-open to a large file descriptor (>=10) so that pipes and such
+        // use the expected small file descriptors.
+        ttyfd = fcntl(fd, F_DUPFD, 10);
+        assert(ttyfd >= 0);
+        close(fd);
+        // The /dev/tty file descriptor should be closed in child processes.
+        fcntl(ttyfd, F_SETFD, FD_CLOEXEC);
+        // Only mess with /dev/tty's controlling process group if the shell
+        // is in /dev/tty's controlling process group.
+        shell_pgid = getpgrp();
+        shell_owns_foreground = (shell_pgid == tcgetpgrp(ttyfd));
+
+        // set signal handlers for the shell
+        if (shell_owns_foreground) {
+            signal(SIGTTIN, SIG_IGN);
+            signal(SIGTTOU, SIG_IGN);
+            signal(SIGCHLD, sigchld_handler);
+            signal(SIGTSTP, sigtstp_handler);
+            signal(SIGINT, sigint_handler);
+            // SIGQUIT produces a core dump when it terminates the process
+            signal(SIGQUIT, SIG_IGN);
+        }
+    }
+
+    // Set the terminal's controlling process group to `p` (so processes in
+    // group `p` can output to the screen, read from the keyboard, etc.).
+    if (shell_owns_foreground && pgid)
+        return tcsetpgrp(ttyfd, pgid);
+    if (shell_owns_foreground)
+        return tcsetpgrp(ttyfd, shell_pgid);
+    // shell is not run interactively
+    return 0;
 }
 
 int main(int argc, char* argv[])
 {
-    // install SIGINT handler
-    signal(SIGINT, sigint_handler);
+    claim_foreground(0);
 
     FILE* command_file = stdin;
     // check for filename option: read commands from file
@@ -599,15 +1052,9 @@ int main(int argc, char* argv[])
             handle_error(argv[1]);
     }
 
-    // - Put the shell into the foreground
-    // - Ignore the SIGTTOU signal, which is sent when the shell is put back
-    //   into the foreground
-    //claim_foreground(0);
-    set_signal_handler(SIGTTOU, SIG_IGN);
-
     char buf[BUFSIZ];
     int bufpos = 0;
-    while (!feof(command_file)) {
+    while (!feof(command_file) || !can_exit()) {
         print_prompt();
 
         // read a string, checking for error or EOF
@@ -628,7 +1075,6 @@ int main(int argc, char* argv[])
         if (bufpos == BUFSIZ - 1 || (bufpos > 0 && buf[bufpos - 1] == '\n')) {
             if (job* j = parse_line(buf)) {
                 run_list_of_jobs(j);
-                release_list_of_jobs(j);
             }
             bufpos = 0;
         }
@@ -636,5 +1082,6 @@ int main(int argc, char* argv[])
         // handle zombie processes and/or interrupt requests
     }
 
+    cout << endl;
     return 0;
 }
