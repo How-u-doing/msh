@@ -11,6 +11,7 @@
 #include <cassert>
 #include <unistd.h>
 #include <fcntl.h>
+#include <termios.h>
 #include <sys/wait.h>
 #include <pwd.h>
 
@@ -53,6 +54,7 @@ struct Command {
 // https://www.gnu.org/software/bash/manual/html_node/Pipelines.html.
 struct Pipeline {
     string str; // the pipeline string, used for messages
+    struct termios tmodes; // each job has their own terminal modes
     Command* first_cmd = nullptr;
     Pipeline* next = nullptr;
     pid_t pgid = -1;
@@ -79,6 +81,8 @@ volatile sig_atomic_t event_pid = 1; // > 0 when waiting a child succeed
                                      // ==0 when any job is completed
                                      // < 0 when any job is signalled
                                      // (STOP, CONT, TERM, etc.)
+struct termios shell_tmodes;
+int shell_terminal = -1;
 bool shell_owns_foreground = false;
 job* current_fg_job = nullptr;
 
@@ -90,7 +94,7 @@ int last_executed_job_status = 0;  // value of $?, and for conditionals,
 // manipulate them.
 map<pid_t, process*> process_list; // to quickly find a process and set state
 map<pid_t, job*> job_list;         // to quickly find a job when given a pgid
-// job-control id starts from `rend()->first + 1`
+// job-control id starts from `rbegin()->first + 1`
 map<int, job*> stopped_or_bg_jobs;
 
 
@@ -507,23 +511,45 @@ void wait_for_job(job* j, sigset_t* oldset)
         sigsuspend(oldset);
 }
 
+void put_job_in_foreground(job* j, bool cont, sigset_t* oldset)
+{
+    claim_foreground(j->pgid);
+    if (cont) {
+        // set terminal modes for the job
+        tcsetattr(shell_terminal, TCSADRAIN, &j->tmodes);
+        kill(- j->pgid, SIGCONT);
+    }
+    wait_for_job(current_fg_job, oldset);
+    claim_foreground(0);
+    // We need to restore shell tmodes since the previous foreground job
+    // (e.g. vim) may have messed up the terminal modes.
+    tcgetattr(shell_terminal, &j->tmodes);
+    tcsetattr(shell_terminal, TCSADRAIN, &shell_tmodes);
+}
+
 void fg(int job_index)
 {
     sigset_t oldset;
     block_all_signals(&oldset);
     delete_completed_jobs();
+    if (stopped_or_bg_jobs.empty()) {
+        msh_error("fg: no jobs");
+        sigprocmask(SIG_SETMASK, &oldset, nullptr);
+        return;
+    }
+    if (job_index == 0)
+        job_index = stopped_or_bg_jobs.rbegin()->first;
     sigprocmask(SIG_SETMASK, &oldset, nullptr);
 
     block_chld_signal(&oldset);
     if (stopped_or_bg_jobs.count(job_index) == 1) {
         current_fg_job = stopped_or_bg_jobs[job_index];
         cout << current_fg_job->str << endl;
-        pid_t pgid = current_fg_job->pgid;
-        kill(- pgid, SIGCONT);
 
-        claim_foreground(pgid);
-        wait_for_job(current_fg_job, &oldset);
-        claim_foreground(0);
+        if (current_fg_job->state == RUNNING) // previously run in background
+            put_job_in_foreground(current_fg_job, /*cont=*/false, &oldset);
+        else // stopped
+            put_job_in_foreground(current_fg_job, /*cont=*/true, &oldset);
 
         current_fg_job = nullptr;
     }
@@ -539,6 +565,13 @@ void bg(int job_index)
     sigset_t oldset;
     block_all_signals(&oldset);
     delete_completed_jobs();
+    if (stopped_or_bg_jobs.empty()) {
+        msh_error("bg: no jobs");
+        sigprocmask(SIG_SETMASK, &oldset, nullptr);
+        return;
+    }
+    if (job_index == 0)
+        job_index = stopped_or_bg_jobs.rbegin()->first;
     if (stopped_or_bg_jobs.count(job_index) == 1) {
         pid_t pgid = stopped_or_bg_jobs[job_index]->pgid;
         kill(- pgid, SIGCONT);
@@ -694,15 +727,8 @@ pid_t run_built_in_cmd(Command* cmd)
         // `fg` needs the original sigset to support `sigsuspend`
         unblock_chld_signal();
         int job_index = 0;
-        if (cmd->args.size() < 2) {
-            if (stopped_or_bg_jobs.empty()) {
-                string msg = cmd_name + ": no jobs";
-                msh_error(msg.c_str());
-                return cmd->pid = 0;
-            }
-            job_index = stopped_or_bg_jobs.rend()->first;
-        }
-        else {
+        // if 2nd argument is empty, choose the job with the largest index
+        if (cmd->args.size() >= 2) {
             string index = &cmd->args[1][1];
             try {
                 job_index = stoi(index);
@@ -869,16 +895,14 @@ void run_pipeline(Pipeline* pipeline)
     if (pipeline->foreground) {
         current_fg_job = pipeline;
 
-        claim_foreground(pipeline->pgid);
-        wait_for_job(current_fg_job, &oldset);
-        claim_foreground(0);
+        put_job_in_foreground(current_fg_job, /*cont=*/false, &oldset);
 
         current_fg_job = nullptr;
     }
     else { // always return success (0) for background jobs
         last_executed_job_status = 0;
         int next = stopped_or_bg_jobs.empty() ?
-                   1 : stopped_or_bg_jobs.cend()->first + 1;
+                   1 : stopped_or_bg_jobs.rbegin()->first + 1;
         stopped_or_bg_jobs[next] = pipeline;
         cout << '[' << next << ']' << '\t' << pipeline->pgid << endl;
     }
@@ -929,7 +953,10 @@ void sigchld_handler(int sig)
     while ((event_pid = waitpid(-1, &wstatus, WUNTRACED | WCONTINUED)) > 0) {
         pid_t pid = event_pid; // pid_t cast
         job* j = find_job(pid);
-        assert(j);
+        if (!j) {
+            assert(WIFSIGNALED(wstatus));
+            break;
+        }
         if (WIFEXITED(wstatus)) {
             process_list[pid]->state = COMPLETED;
             if (pid == last_process_in_job(j)) {
@@ -949,7 +976,7 @@ void sigchld_handler(int sig)
             int job_index = find_job_in_stopped_or_bg_jobs(j);
             if (job_index == 0) { // not found
                 job_index = stopped_or_bg_jobs.empty() ?
-                            1 : stopped_or_bg_jobs.cend()->first + 1;
+                            1 : stopped_or_bg_jobs.rbegin()->first + 1;
                 stopped_or_bg_jobs[job_index] = j;
             }
             set_job_state(j, STOPPED);
@@ -1015,6 +1042,7 @@ int claim_foreground(pid_t pgid)
         fcntl(ttyfd, F_SETFD, FD_CLOEXEC);
         // Only mess with /dev/tty's controlling process group if the shell
         // is in /dev/tty's controlling process group.
+        shell_terminal = ttyfd;
         shell_pgid = getpgrp();
         shell_owns_foreground = (shell_pgid == tcgetpgrp(ttyfd));
 
@@ -1027,15 +1055,18 @@ int claim_foreground(pid_t pgid)
             signal(SIGINT, sigint_handler);
             // SIGQUIT produces a core dump when it terminates the process
             signal(SIGQUIT, SIG_IGN);
+
+            // save default terminal attributes for shell
+            tcgetattr(shell_terminal, &shell_tmodes);
         }
     }
 
     // Set the terminal's controlling process group to `p` (so processes in
     // group `p` can output to the screen, read from the keyboard, etc.).
     if (shell_owns_foreground && pgid)
-        return tcsetpgrp(ttyfd, pgid);
+        return tcsetpgrp(shell_terminal, pgid);
     if (shell_owns_foreground)
-        return tcsetpgrp(ttyfd, shell_pgid);
+        return tcsetpgrp(shell_terminal, shell_pgid);
     // shell is not run interactively
     return 0;
 }
