@@ -1,0 +1,7 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+BreakBeforeBraces: Stroustrup
+AccessModifierOffset: -4
+IndentWidth: 4
+TabWidth: 4

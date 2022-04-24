@@ -29,9 +29,10 @@ using namespace std;
 #define REDIRECT_OP_APPEND  3   // >>
 #define REDIRECT_OP_ERRAPP  4   // 2>>
 
-#define RUNNING    0
-#define STOPPED    1
-#define COMPLETED  2
+#define RUNNING     0
+#define STOPPED     1
+#define COMPLETED   2
+#define TERMINATED  3
 
 // a simple command, e.g. grep test > tmp (<) Makefile
 struct Command {
@@ -59,7 +60,7 @@ struct Pipeline {
     Pipeline* next = nullptr;
     pid_t pgid = -1;
     int state = RUNNING;
-    bool notified = false;
+    bool notified = true;    // only terminated jobs set it false
     bool foreground = true;
     bool next_is_or = false; // || or && (valid when `last == false`)
     bool last = false;       // is pipeline last one in a conditional
@@ -71,16 +72,6 @@ struct Pipeline {
 typedef Command process;
 typedef Pipeline job;
 
-#define EVENT_JOB_DONE   0
-#define EVENT_JOB_TERM  -1
-#define EVENT_JOB_STOP  -2
-#define EVENT_JOB_CONT  -3
-
-// job state-changing indicator; PRESET a value before using it
-volatile sig_atomic_t event_pid = 1; // > 0 when waiting a child succeed
-                                     // ==0 when any job is completed
-                                     // < 0 when any job is signalled
-                                     // (STOP, CONT, TERM, etc.)
 struct termios shell_tmodes;
 int shell_terminal = -1;
 bool shell_owns_foreground = false;
@@ -119,7 +110,7 @@ struct List {
 #endif
 
 
-const char* state_strings[3] = { "Running", "Stopped", "Done" };
+const char* state_strings[] = { "Running", "Stopped", "Done", "Terminated" };
 
 pid_t last_process_in_job(job* j)
 {
@@ -161,10 +152,10 @@ bool job_stopped(job* j)
     return true;
 }
 
-bool job_completed(job* j)
+bool job_in_state(job* j, int state)
 {
     for (process* p = j->first_cmd; p; p = p->next) {
-        if (p->state != COMPLETED)
+        if (p->state != state)
             return false;
     }
     return true;
@@ -203,14 +194,20 @@ string expand_tilde(const string& path)
 
 void cd(const string& path)
 {
-    if (chdir(expand_tilde(path).c_str()) == -1)
+    if (chdir(expand_tilde(path).c_str()) == -1) {
         perror("chdir");
-    get_cwd();
+        last_executed_job_status = EXIT_FAILURE;
+    }
+    else {
+        get_cwd();
+        last_executed_job_status = 0;
+    }
 }
 
 void pwd()
 {
     cout << cwd << endl;
+    last_executed_job_status = 0;
 }
 
 #define GREEN "\033[32m"
@@ -257,13 +254,20 @@ void release_cmdline(Command* cmd)
     release_cmds(cmd);
 }
 
+// this routine just releases resources, while the `delete_job`
+// routine also removes the job from the job-control lists
+void release_job(job* j)
+{
+    release_cmds(j->first_cmd);
+    delete j;
+}
+
 // used when a job is completed or for cleaning on shell exiting
 auto delete_job(job* j)
 {
     for (process* p = j->first_cmd; p; p = p->next) {
         process_list.erase(p->pid);
     }
-    release_cmds(j->first_cmd);
 
     int job_index = find_job_in_stopped_or_bg_jobs(j);
     if (job_index != 0) {
@@ -273,7 +277,8 @@ auto delete_job(job* j)
     auto it = job_list.find(j->pgid);
     assert(it != job_list.end());
     auto next = job_list.erase(it);
-    delete j;
+
+    release_job(j);
     return next;
 }
 
@@ -375,7 +380,10 @@ job* parse_line(const char* s)
         case TYPE_AND:
         case TYPE_OR:
             // these operators terminate the current command
-            if (!ccur) {
+            auto next = it;
+            ++next;
+            if (!ccur || (next == parser.end() && (it.type() == TYPE_PIPE ||
+                          it.type() == TYPE_AND || it.type() == TYPE_OR))) {
                 string msg = "syntax error near unexpected token " + it.str();
                 msh_error(msg.c_str());
                 release_cmdline(chead);
@@ -394,25 +402,23 @@ job* parse_line(const char* s)
     job* jcur  = nullptr;
     if (chead) {
         jcur = jhead = new Pipeline;
-        jcur->first_cmd = chead;
-        jcur->str = chead->str;
     }
     bool first_cmd_in_pipeline = true;
     Command* prev_pipeline_last_cmd = nullptr;
     for (Command* cmd = chead; cmd; cmd = cmd->next) {
+        if (first_cmd_in_pipeline) {
+            jcur->first_cmd = cmd;
+            jcur->str = cmd->str;
+            first_cmd_in_pipeline = false;
+            if (prev_pipeline_last_cmd)
+                prev_pipeline_last_cmd->next = nullptr;
+        }
         if (cmd->op == TYPE_PIPE) {
             jcur->str += " | " + cmd->next->str;
-            if (first_cmd_in_pipeline) {
-                jcur->first_cmd = cmd;
-                first_cmd_in_pipeline = false;
-                if (prev_pipeline_last_cmd)
-                    prev_pipeline_last_cmd->next = nullptr;
-            }
         }
         else { // might need to create a new pipeline
             if (cmd->next) {
                 jcur->next = new Pipeline;
-                jcur->next->str = cmd->next->str;
                 first_cmd_in_pipeline = true;
                 prev_pipeline_last_cmd = cmd;
                 if (cmd->op == TYPE_OR || cmd->op == TYPE_AND) {
@@ -479,13 +485,34 @@ void format_job_info(int job_index, job* j)
          << j->str << endl;
 }
 
-void delete_completed_jobs()
+// set uncompleted processes in job `j` with `state`
+void set_job_state(job* j, int state)
+{
+    for (process* p = j->first_cmd; p; p = p->next) {
+        if (p->state != COMPLETED)
+            p->state = state;
+    }
+    j->state = state;
+}
+
+// delete completed and terminated jobs
+void delete_finished_jobs()
 {
     for (auto it = job_list.begin(); it != job_list.end(); ) {
-        if (it->second->state == COMPLETED)
-            it = delete_job(it->second);
-        else
+        job* j = it->second;
+        if (j->state == COMPLETED || j->state == TERMINATED) {
+            if (!j->notified) { // `notified` is false only for terminated jobs
+                int job_index = find_job_in_stopped_or_bg_jobs(j);
+                if (job_index != 0)
+                    format_job_info(job_index, j);
+                else
+                    cerr << "Killed" << endl;
+            }
+            it = delete_job(j);
+        }
+        else {
             ++it;
+        }
     }
 }
 
@@ -495,19 +522,16 @@ void jobs()
     block_all_signals(&oldset);
     for (const auto& j : stopped_or_bg_jobs) {
         format_job_info(j.first, j.second);
+        j.second->notified = true;
     }
-    delete_completed_jobs();
+    delete_finished_jobs();
     sigprocmask(SIG_SETMASK, &oldset, nullptr);
+    last_executed_job_status = 0;
 }
 
 void wait_for_job(job* j, sigset_t* oldset)
 {
-    event_pid = 1;
-    // Note that event_pid != EVENT_JOB_DONE does not necessarily mean the job
-    // is finished, it just means some job has done (maybe not this job `j`)
-    while (j->state != COMPLETED &&
-           event_pid != EVENT_JOB_STOP &&
-           event_pid != EVENT_JOB_TERM)
+    while (j->state == RUNNING)
         sigsuspend(oldset);
 }
 
@@ -517,13 +541,21 @@ void put_job_in_foreground(job* j, bool cont, sigset_t* oldset)
     if (cont) {
         // set terminal modes for the job
         tcsetattr(shell_terminal, TCSADRAIN, &j->tmodes);
-        kill(- j->pgid, SIGCONT);
+        if (kill(- j->pgid, SIGCONT) < 0)
+            perror("kill (SIGCONT)");
+        else
+            set_job_state(j, RUNNING);
     }
-    wait_for_job(current_fg_job, oldset);
+    wait_for_job(j, oldset);
     claim_foreground(0);
+    if (j->state == STOPPED) {
+        cout << '\n';
+        format_job_info(find_job_in_stopped_or_bg_jobs(j), j);
+        // we don't need to save tmodes if the job is completed or terminated
+        tcgetattr(shell_terminal, &j->tmodes);
+    }
     // We need to restore shell tmodes since the previous foreground job
     // (e.g. vim) may have messed up the terminal modes.
-    tcgetattr(shell_terminal, &j->tmodes);
     tcsetattr(shell_terminal, TCSADRAIN, &shell_tmodes);
 }
 
@@ -531,31 +563,38 @@ void fg(int job_index)
 {
     sigset_t oldset;
     block_all_signals(&oldset);
-    delete_completed_jobs();
+    delete_finished_jobs();
     if (stopped_or_bg_jobs.empty()) {
         msh_error("fg: no jobs");
         sigprocmask(SIG_SETMASK, &oldset, nullptr);
+        last_executed_job_status = EXIT_FAILURE;
         return;
     }
     if (job_index == 0)
         job_index = stopped_or_bg_jobs.rbegin()->first;
-    sigprocmask(SIG_SETMASK, &oldset, nullptr);
 
-    block_chld_signal(&oldset);
     if (stopped_or_bg_jobs.count(job_index) == 1) {
         current_fg_job = stopped_or_bg_jobs[job_index];
+        current_fg_job->foreground = true; // if it was a background job before
         cout << current_fg_job->str << endl;
 
-        if (current_fg_job->state == RUNNING) // previously run in background
+        if (current_fg_job->state == RUNNING) // previously ran in background
             put_job_in_foreground(current_fg_job, /*cont=*/false, &oldset);
         else // stopped
             put_job_in_foreground(current_fg_job, /*cont=*/true, &oldset);
 
+        if (current_fg_job->state == TERMINATED && !current_fg_job->notified) {
+            cerr << "Terminated" << endl;
+            delete_job(current_fg_job);
+        }
+
         current_fg_job = nullptr;
+        last_executed_job_status = 0;
     }
     else {
         string msg = "fg: %" + to_string(job_index) + ": no such job";
         msh_error(msg.c_str());
+        last_executed_job_status = EXIT_FAILURE;
     }
     sigprocmask(SIG_SETMASK, &oldset, nullptr);
 }
@@ -564,21 +603,30 @@ void bg(int job_index)
 {
     sigset_t oldset;
     block_all_signals(&oldset);
-    delete_completed_jobs();
+    delete_finished_jobs();
     if (stopped_or_bg_jobs.empty()) {
         msh_error("bg: no jobs");
         sigprocmask(SIG_SETMASK, &oldset, nullptr);
+        last_executed_job_status = EXIT_FAILURE;
         return;
     }
     if (job_index == 0)
         job_index = stopped_or_bg_jobs.rbegin()->first;
+
     if (stopped_or_bg_jobs.count(job_index) == 1) {
-        pid_t pgid = stopped_or_bg_jobs[job_index]->pgid;
-        kill(- pgid, SIGCONT);
+        job* j = stopped_or_bg_jobs[job_index];
+        j->foreground = false; // if it was a foreground job before
+        cout << '[' << job_index << ']' << '\t' << j->str << " &" << endl;
+        if (kill(- j->pgid, SIGCONT) < 0)
+            perror("kill (SIGCONT)");
+        else
+            set_job_state(j, RUNNING);
+        last_executed_job_status = 0;
     }
     else {
-        string msg = "fg: %" + to_string(job_index) + ": no such job";
+        string msg = "bg: %" + to_string(job_index) + ": no such job";
         msh_error(msg.c_str());
+        last_executed_job_status = EXIT_FAILURE;
     }
     sigprocmask(SIG_SETMASK, &oldset, nullptr);
 }
@@ -609,8 +657,11 @@ bool can_exit()
         return false;
     }
     for (auto it = job_list.begin(); it != job_list.end(); ) {
-        if (it->second->state == COMPLETED)
-            kill(- it->second->pgid, SIGKILL);
+        int state = it->second->state;
+        if (state != COMPLETED && state != TERMINATED) {
+            if (kill(- it->second->pgid, SIGQUIT) < 0)
+                perror("kill (SIGQUIT)");
+        }
         it = delete_job(it->second);
     }
     return true;
@@ -669,85 +720,95 @@ void set_up_redirections(Command* cmd)
 pid_t run_built_in_cmd(Command* cmd)
 {
     const string& cmd_name = cmd->args[0];
+    if (cmd_name != "exit" && cmd_name != "cd" && cmd_name != "jobs" &&
+        cmd_name != "fg"   && cmd_name != "bg")
+        return -1;
+
+    // Redirections for built-in commands require us to make backups for
+    // stdin/out/err, and then copy them back.
+    int saved_infd  = dup(0);
+    int saved_outfd = dup(1);
+    int saved_errfd = dup(2);
+    cmd->pid = 0;
+    // can only be set once, child processes MUST NOT set it again
+    set_up_redirections(cmd);
+
     if (cmd_name == "exit") {
-        if (!can_exit())
-            return 0; // cannot exit yet this time
-        if (cmd->args.size() == 1)
-            exit(EXIT_SUCCESS);
-        else {
-            int exit_code = 1;
-            try {
-                exit_code = stoi(cmd->args[1]);
+        if (can_exit()) {
+            int exit_code = EXIT_SUCCESS;
+            if (cmd->args.size() > 1) {
+                try {
+                    exit_code = stoi(cmd->args[1]);
+                }
+                catch(const std::invalid_argument& e) {
+                    msh_error("numeric argument required");
+                    exit_code = EXIT_FAILURE;
+                }
+                catch(const std::out_of_range& e) {
+                    msh_error("exit number out of range");
+                    exit_code = EXIT_FAILURE;
+                }
+                catch (...) {
+                    exit_code = EXIT_FAILURE;
+                }
             }
-            catch(const std::invalid_argument& e) {
-                msh_error("numeric argument required");
-                exit(EXIT_FAILURE);
-            }
-            catch(const std::out_of_range& e) {
-                msh_error("exit number out of range");
-                exit(EXIT_FAILURE);
-            }
-            catch (...) {
-                exit(EXIT_FAILURE);
-            }
+            close(saved_infd);
+            close(saved_outfd);
+            close(saved_errfd);
             exit(exit_code);
         }
     }
     if (cmd_name == "cd") {
         string path = cmd->args.size() == 1 ? "~" : cmd->args[1];
         cd(path);
-        return cmd->pid = 0;
     }
     else if (cmd_name == "jobs") {
-        // jobs > job_list.txt
-        cmd->pid = 0;
-        // Redirections for built-in commands require us to make backups for
-        // stdin/out/err, and then copy them back.
-        int saved_infd  = dup(0);
-        int saved_outfd = dup(1);
-        int saved_errfd = dup(2);
-
-        set_up_redirections(cmd);
         jobs();
-
-        // copy back
-        if (cmd->infd != 0)
-            dup2(saved_infd, 0);
-        if (cmd->outfd != 1)
-            dup2(saved_outfd, 1);
-        if (cmd->errfd != 2)
-            dup2(saved_errfd, 2);
-        close(saved_infd);
-        close(saved_outfd);
-        close(saved_errfd);
-
-        return 0;
     }
     else if (cmd_name == "fg" || cmd_name == "bg") {
         // `fg` needs the original sigset to support `sigsuspend`
         unblock_chld_signal();
-        int job_index = 0;
-        // if 2nd argument is empty, choose the job with the largest index
-        if (cmd->args.size() >= 2) {
-            string index = &cmd->args[1][1];
+        if (cmd->args.size() == 1) {
+            if (cmd_name == "fg")
+                fg(0);
+            else
+                bg(0);
+        }
+        else {
+            int job_index = -1;
+            string index;
             try {
-                job_index = stoi(index);
+                if (cmd->args[1][0] != '%')
+                    throw "job index not started with %";
+                index = &cmd->args[1][1];
+                job_index = stoi(index); // might throw
+                if (job_index <= 0) // stoi succeeded, but might not be valid
+                    throw "job index must be positive";
+                if (cmd_name == "fg")
+                    fg(job_index);
+                else
+                    bg(job_index);
             }
             catch (...) {
-                string msg = cmd_name + ": %" + index + ": no such job";
+                string msg = cmd_name + ": " + cmd->args[1] + ": no such job";
                 msh_error(msg.c_str());
-                return cmd->pid = 0;
+                last_executed_job_status = EXIT_FAILURE;
             }
         }
-
-        if (cmd_name == "fg")
-            fg(job_index);
-        else if (cmd_name == "bg")
-            bg(job_index);
-
-        return cmd->pid = 0;
     }
-    return -1;
+
+    // copy back
+    if (cmd->infd != 0)
+        dup2(saved_infd, 0);
+    if (cmd->outfd != 1)
+        dup2(saved_outfd, 1);
+    if (cmd->errfd != 2)
+        dup2(saved_errfd, 2);
+    close(saved_infd);
+    close(saved_outfd);
+    close(saved_errfd);
+
+    return 0;
 }
 
 // `getconf ARG_MAX` on my machine gives 2'097'152 (scary)
@@ -910,67 +971,123 @@ void run_pipeline(Pipeline* pipeline)
     sigprocmask(SIG_SETMASK, &oldset, nullptr);
 }
 
-void run_list_of_jobs(job* j)
+void release_jobs(job* j)
 {
     while (j) {
+        job* del = j;
+        j = j->next;
+        release_job(del);
+    }
+}
+
+void run_list_of_jobs(job* j)
+{
+    bool chain_is_true = true;
+    job* prev_job = nullptr;
+    vector<job*> skipped_jobs;
+    while (j) {
         run_pipeline(j);
+        if (j->pgid == -1) { // built-in commands
+            j->state = COMPLETED;
+            // release built-in commands like canceled jobs
+            skipped_jobs.push_back(j);
+        }
+        if (j->state == TERMINATED) {
+            release_jobs(j->next);
+            break;
+        }
+
+        // true && false && true || echo yes || echo no
+        //                 !eval                 !eval
+        bool this_job_succeeded = last_executed_job_status == 0;
+        if (prev_job && prev_job->next_is_or)
+            chain_is_true = chain_is_true || this_job_succeeded;
+        else
+            chain_is_true = chain_is_true && this_job_succeeded;
+
         if (!j->last) { // not the last pipeline in a conditional
             sigset_t oldset;
             block_chld_signal(&oldset);
 
+#if 1
+            /*
+             * In fish shell, `sleep 10 && echo foo &` is parsed as running
+             * `sleep 10` in the foreground and running `echo foo` in the
+             * background. However, `sleep 10 && echo foo` is treated as a
+             * whole running in the background in bash shell.
+             * Thus,
+             * `sleep 0.2 && echo Second & sleep 0.1 && echo First` gives
+             * "Second First" in fish and "First Second" in bash.
+             * For now jobs in a background conditional are also waited in
+             * the foregrond. To implement waiting jobs that are run in the
+             * background, we'll need some extra data structures.
+             * For example, we may need a vector that holds a list of
+             * conditionals that run in the background. And we will decide
+             * whether to run the next job after an AND/OR based on the
+             * return status of the background job in the exactly same
+             * fashion as we do here in the foreground.
+             */
             wait_for_job(j, &oldset);
+#else
+            // wait the job in a conditional chain in background
+            if (!j->foreground) {
+                // to be implemented...
+            }
+#endif
             sigprocmask(SIG_SETMASK, &oldset, nullptr);
 
-            if (j->next_is_or) { // ... job1 || job2
-                if (last_executed_job_status == 0)
-                    j = j->next; // skip job2
-            }
-            else { // ... job1 && job2
-                if (last_executed_job_status != 0)
-                    j = j->next; // skip job2
+            // skip subsequent ORs if chain is true or
+            //      subsequent ANDs if chain is false
+            while ((chain_is_true && j->next_is_or) ||
+                  (!chain_is_true && !j->next_is_or)) {
+                // ... chain || job2  (chain status is true)
+                // ... chain && job2  (chain status is false)
+                skipped_jobs.push_back(j->next);
+                j = j->next;
+                if (j->last)
+                    break;
             }
         }
+        else {
+            // reset chain status
+            chain_is_true = true;
+        }
+        prev_job = j;
         j = j->next;
     }
-}
 
-// set uncompleted processes in job `j` with `state`
-void set_job_state(job* j, int state)
-{
-    for (process* p = j->first_cmd; p; p = p->next) {
-        if (p->state != COMPLETED)
-            p->state = state;
-    }
-    j->state = state;
+    for (job* skip : skipped_jobs)
+        release_job(skip);
+    delete_finished_jobs();
 }
 
 void sigchld_handler(int sig)
 {
     (void) sig;
     int old_errno = errno;
-    //sigset_t oldset;
     int wstatus;
-    while ((event_pid = waitpid(-1, &wstatus, WUNTRACED | WCONTINUED)) > 0) {
-        pid_t pid = event_pid; // pid_t cast
+    pid_t pid;
+    while ((pid = waitpid(-1, &wstatus, WUNTRACED | WCONTINUED)) > 0) {
         job* j = find_job(pid);
-        if (!j) {
-            assert(WIFSIGNALED(wstatus));
-            break;
-        }
+        assert(j);
         if (WIFEXITED(wstatus)) {
-            process_list[pid]->state = COMPLETED;
             if (pid == last_process_in_job(j)) {
                 last_executed_job_status = WEXITSTATUS(wstatus);
             }
-            if (job_completed(j)) {
+            process_list[pid]->state = COMPLETED;
+            if (job_in_state(j, COMPLETED)) {
                 j->state = COMPLETED;
-                event_pid = EVENT_JOB_DONE;
+                break;
             }
         }
         else if (WIFSIGNALED(wstatus)) {
-            delete_job(j);
+            process_list[pid]->state = TERMINATED;
+            if (job_in_state(j, TERMINATED))
+                j->state = TERMINATED;
             last_executed_job_status = WTERMSIG(wstatus);
-            event_pid = EVENT_JOB_TERM;
+            if (last_executed_job_status != SIGINT)
+                j->notified = false; // don't notify interrupted jobs to the user
+            break;
         }
         else if (WIFSTOPPED(wstatus)) {
             int job_index = find_job_in_stopped_or_bg_jobs(j);
@@ -979,17 +1096,16 @@ void sigchld_handler(int sig)
                             1 : stopped_or_bg_jobs.rbegin()->first + 1;
                 stopped_or_bg_jobs[job_index] = j;
             }
-            set_job_state(j, STOPPED);
-            last_executed_job_status = WSTOPSIG(wstatus);
-            event_pid = EVENT_JOB_STOP;
+            process_list[pid]->state = STOPPED;
+            if (job_in_state(j, STOPPED)) {
+                j->state = STOPPED;
+                last_executed_job_status = WSTOPSIG(wstatus);
+            }
+            break;
         }
         else if (WIFCONTINUED(wstatus)) {
-            set_job_state(j, RUNNING);
-            event_pid = EVENT_JOB_CONT;
-        }
-
-        if (event_pid <= 0)
             break;
+        }
     }
     errno = old_errno;
 }
@@ -1000,7 +1116,8 @@ void sigint_handler(int sig)
     int old_errno = errno;
     if (current_fg_job) {
         // not necessarily kills it, e.g. vim, emacs, etc.
-        kill(- current_fg_job->pgid, SIGINT);
+        if (kill(- current_fg_job->pgid, SIGINT) < 0)
+            perror("kill (SIGINT)");
     }
     else {
         cout << '\n';
@@ -1014,7 +1131,8 @@ void sigtstp_handler(int sig)
     (void) sig;
     int old_errno = errno;
     if (current_fg_job) {
-        kill(- current_fg_job->pgid, SIGTSTP);
+        if (kill(- current_fg_job->pgid, SIGTSTP) < 0)
+            perror("kill (SIGTSTP)");
     }
     errno = old_errno;
 }
@@ -1071,6 +1189,8 @@ int claim_foreground(pid_t pgid)
     return 0;
 }
 
+#ifndef SH61_TESTS
+
 int main(int argc, char* argv[])
 {
     claim_foreground(0);
@@ -1113,6 +1233,81 @@ int main(int argc, char* argv[])
         // handle zombie processes and/or interrupt requests
     }
 
-    cout << endl;
+    cout << "exit" << endl;
     return 0;
 }
+
+#else // sh61 tests
+
+int main(int argc, char* argv[])
+{
+    // init cwd
+    get_cwd();
+
+    FILE* command_file = stdin;
+    bool quiet = false;
+
+    // Check for `-q` option: be quiet (print no prompts)
+    if (argc > 1 && strcmp(argv[1], "-q") == 0) {
+        quiet = true;
+        --argc, ++argv;
+    }
+
+    // Check for filename option: read commands from file
+    if (argc > 1) {
+        command_file = fopen(argv[1], "rb");
+        if (!command_file) {
+            perror(argv[1]);
+            return 1;
+        }
+    }
+
+    // - Put the shell into the foreground
+    // - Ignore the SIGTTOU signal, which is sent when the shell is put back
+    //   into the foreground
+    claim_foreground(0);
+    set_signal_handler(SIGTTOU, SIG_IGN);
+
+    char buf[BUFSIZ];
+    int bufpos = 0;
+    bool needprompt = true;
+
+    while (!feof(command_file) || !can_exit()) {
+        // Print the prompt at the beginning of the line
+        if (needprompt && !quiet) {
+            printf("sh61[%d]$ ", getpid());
+            fflush(stdout);
+            needprompt = false;
+        }
+
+        // Read a string, checking for error or EOF
+        if (fgets(&buf[bufpos], BUFSIZ - bufpos, command_file) == nullptr) {
+            if (ferror(command_file) && errno == EINTR) {
+                // ignore EINTR errors
+                clearerr(command_file);
+                buf[bufpos] = 0;
+            } else {
+                if (ferror(command_file)) {
+                    perror("sh61");
+                }
+                break;
+            }
+        }
+
+        // If a complete command line has been provided, run it
+        bufpos = strlen(buf);
+        if (bufpos == BUFSIZ - 1 || (bufpos > 0 && buf[bufpos - 1] == '\n')) {
+            if (job* j = parse_line(buf)) {
+                run_list_of_jobs(j);
+            }
+            bufpos = 0;
+            needprompt = 1;
+        }
+
+        // Handle zombie processes and/or interrupt requests
+        // Your code here!
+    }
+
+    return 0;
+}
+#endif
