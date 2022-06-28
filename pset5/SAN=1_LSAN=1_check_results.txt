@@ -8,48 +8,36 @@ Test BG1: FAILED in 10.205 sec
     Command  `cp fBG1a.txt fBG1b.txt &`
     Output   `Copied`
   timeout after 10.00s
-Test BG2: FAILED in 0.056 sec
+Test BG2: FAILED in 0.250 sec
     Checking for background command is not waited for
     Command  `sleep 2 &`
     Expected `1`
     Got      ``
     sanitizer reports errors:
       =================================================================
-      ==810399==ERROR: LeakSanitizer: detected memory leaks
-      
+      ==1064644==ERROR: LeakSanitizer: detected memory leaks
+
       Direct leak of 128 byte(s) in 1 object(s) allocated from:
-          #0 0x7f84de6e35a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x5574857b5bc1 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:404
-      
+          #0 0x7f1ff3c9c5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
+          #1 0x55cf006379b1 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:385
+
       Indirect leak of 112 byte(s) in 1 object(s) allocated from:
-          #0 0x7f84de6e35a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x5574857b4ed0 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:306
-      
+          #0 0x7f1ff3c9c5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
+          #1 0x55cf00636cc0 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:287
+
       SUMMARY: AddressSanitizer: 240 byte(s) leaked in 2 allocation(s).
       1
-Test BG3: FAILED in 0.060 sec
+Test BG3: FAILED in 10.205 sec
     Checking for background command is not waited for
     Command  `sh -c "sleep 0.2; test -r fBG3b.txt && rm -f fBG3a.txt" &`
     Expected `Still here`
     Got      ``
+  timeout after 10.00s
     sanitizer reports errors:
       =================================================================
-      ==810408==ERROR: LeakSanitizer: detected memory leaks
-      
-      Direct leak of 128 byte(s) in 1 object(s) allocated from:
-          #0 0x7f5a7e31b5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x564736222bc1 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:404
-      
-      Indirect leak of 112 byte(s) in 1 object(s) allocated from:
-          #0 0x7f5a7e31b5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x564736221ed0 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:306
-      
-      Indirect leak of 54 byte(s) in 1 object(s) allocated from:
-          #0 0x7f5a7e31b5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x7f5a7e1923fe in std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_assign(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) (/lib/x86_64-linux-gnu/libstdc++.so.6+0x1473fe)
-      
-      Indirect leak of 54 byte(s) in 1 object(s) allocated from:
-          #0 0x7f5a7e31b5a7 in operator new(unsigned long) ../../../../src/libsanitizer/...
+      ==1064655==ERROR: AddressSanitizer: heap-use-after-free on address 0x604000000138 at pc 0x5625dea8402d bp 0x7ffd5fd44560 sp 0x7ffd5fd44550
+      READ of size 8 at 0x604000000138 thread T0
+      cat: fBG3a.txt: No such file or directory
 Test LIST1: passed
 Test LIST2: passed
 Test LIST3: passed
@@ -63,51 +51,41 @@ Test LIST6: FAILED in 10.205 sec
   timeout after 10.00s
     sanitizer reports errors:
       =================================================================
-      ==810456==ERROR: AddressSanitizer: heap-use-after-free on address 0x604000000078 at pc 0x556d507a713d bp 0x7fff5795a2d0 sp 0x7fff5795a2c0
+      ==1064840==ERROR: AddressSanitizer: heap-use-after-free on address 0x604000000078 at pc 0x55ded743302d bp 0x7ffd3937da60 sp 0x7ffd3937da50
       READ of size 8 at 0x604000000078 thread T0
       1
-Test LIST7: FAILED in 0.093 sec
+Test LIST7: FAILED in 0.247 sec
     Checking for semicolon/background precedence
     Command  `../msh -q cmdLIST7.sh`
     Expected `Hello Bye 1`
     Got      `Hello Bye`
     sanitizer reports errors:
       =================================================================
-      ==810510==ERROR: LeakSanitizer: detected memory leaks
-      
+      ==1064922==ERROR: LeakSanitizer: detected memory leaks
+
       Direct leak of 128 byte(s) in 1 object(s) allocated from:
-          #0 0x7fb0f03675a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x55e24677de51 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:421
-      
+          #0 0x7fb9f60415a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
+          #1 0x5653164f1c41 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:402
+
       Indirect leak of 112 byte(s) in 1 object(s) allocated from:
-          #0 0x7fb0f03675a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x55e24677ced0 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:306
-      
+          #0 0x7fb9f60415a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
+          #1 0x5653164f0cc0 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:287
+
       Indirect leak of 64 byte(s) in 1 object(s) allocated from:
-          #0 0x7fb0f03675a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x55e246791797 in __gnu_cxx::new_allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >::allocate(unsigned long, void const*) /usr/include/c++/11/ext/new_allocator.h:121
-          #2 0x55e246791797 in std::allocator_traits<std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >::allocate(std::allocator<std::__cx...
+          #0 0x7fb9f60415a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
+          #1 0x5653165049e7 in __gnu_cxx::new_allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >::allocate(unsigned long, void const*) /usr/include/c++/11/ext/new_allocator.h:121
+          #2 0x5653165049e7 in std::allocator_traits<std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >::allocate(std::allocator<std::__c...
 Test LIST8: passed
-Test LIST9: passed
+Test LIST9: FAILED in 10.205 sec
+    Checking for second background does not wait
+    Command  `sleep 0.2 & sleep 0.2 & echo OK`
+    Output   `OK`
+    Should have completed in 0.100 sec
+  timeout after 10.00s
     sanitizer reports errors:
       =================================================================
-      ==810530==ERROR: LeakSanitizer: detected memory leaks
-      
-      Direct leak of 128 byte(s) in 1 object(s) allocated from:
-          #0 0x7fcbd0aab5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x55f0689e6bc1 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:404
-      
-      Indirect leak of 224 byte(s) in 2 object(s) allocated from:
-          #0 0x7fcbd0aab5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x55f0689e5ed0 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:306
-      
-      Indirect leak of 128 byte(s) in 1 object(s) allocated from:
-          #0 0x7fcbd0aab5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x55f0689e6e51 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:421
-      
-      Indirect leak of 128 byte(s) in 2 object(s) allocated from:
-          #0 0x7fcbd0aab5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x55f0689fa797 in __gnu_cxx::new_allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >::a...
+      ==1064942==ERROR: AddressSanitizer: heap-use-after-free on address 0x604000000078 at pc 0x55847e7da02d bp 0x7ffe207e9620 sp 0x7ffe207e9610
+      READ of size 8 at 0x604000000078 thread T0
 Test COND1: passed
 Test COND2: passed
 Test COND3: passed
@@ -119,12 +97,12 @@ Test COND8: passed
 Test COND9: passed
 Test COND10: passed
 Test COND11: passed
-Test COND12: FAILED in 0.340 sec
+Test COND12: FAILED in 0.330 sec
     Checking for conditional chains and background
     Command  `sleep 0.2 && echo Second & sleep 0.1 && echo First`
     Expected `First Second`
     Got      `Second First`
-Test COND13: FAILED in 0.290 sec
+Test COND13: FAILED in 0.286 sec
     Checking for more conditionals with background
     Command  `echo first && sleep 0.1 && echo third & sleep 0.05 ; echo second ; sleep 0.1 ; echo fourth`
     Expected `first second third fourth`
@@ -134,52 +112,60 @@ Test COND14: FAILED in 0.026 sec
     Command  `../build/timeout.sh 0.02 sleep 10 || echo yes`
     Expected `yes`
     Got      `execvp: Permission denied yes`
-Test COND15: FAILED in 0.025 sec
+Test COND15: FAILED in 0.026 sec
     Checking for non-exit status and &&
     Command  `../build/timeout.sh 0.02 sleep 10 && echo no`
     Expected ``
     Got      `execvp: Permission denied`
 Test PIPE1: passed
-Test PIPE2: FAILED in 10.205 sec
-    Checking for simple pipeline
-    Command  `echo Ignored | echo Desired`
-    Output   `Desired`
-  timeout after 10.00s
+Test PIPE2: passed
 Test PIPE3: passed
 Test PIPE4: passed
-Test PIPE5: FAILED in 10.207 sec
-    Checking for pipeline running in parallel
-    Command  `yes | head -n 5`
-    Output   `y y y y y`
-  timeout after 10.00s
+Test PIPE5: passed
 Test PIPE6: passed
 Test PIPE7: passed
 Test PIPE8: passed
 Test PIPE9: passed
 Test PIPE10: passed
 Test PIPE11: passed
-Test PIPE12: FAILED in 0.100 sec
+Test PIPE12: FAILED in 0.273 sec
     Checking for pipelines, background, semicolons
-    Command  `../msh -q cmdPIPE12.sh; ps t /dev/pts/0 | grep -m1 "slee*p" | wc -l`
+    Command  `../msh -q cmdPIPE12.sh; ps t /dev/pts/1 | grep -m1 "slee*p" | wc -l`
     Expected `Hello Bye 1`
     Got      `Hello Bye`
     sanitizer reports errors:
       =================================================================
-      ==810790==ERROR: LeakSanitizer: detected memory leaks
-      
+      ==1065240==ERROR: LeakSanitizer: detected memory leaks
+
       Direct leak of 128 byte(s) in 1 object(s) allocated from:
-          #0 0x7f4493dab5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x55689acb6e51 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:421
-      
+          #0 0x7f61bd10b5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
+          #1 0x5566a6922c41 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:402
+
       Indirect leak of 112 byte(s) in 1 object(s) allocated from:
-          #0 0x7f4493dab5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x55689acb5ed0 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:306
-      
+          #0 0x7f61bd10b5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
+          #1 0x5566a6921cc0 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:287
+
       Indirect leak of 64 byte(s) in 1 object(s) allocated from:
-          #0 0x7f4493dab5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
-          #1 0x55689acca797 in __gnu_cxx::new_allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >::allocate(unsigned long, void const*) /usr/include/c++/11/ext/new_allocator.h:121
-          #2 0x55689acca797 in std::allocator_traits<std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >::allocate(std::allocator<std::__cx...
+          #0 0x7f61bd10b5a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
+          #1 0x5566a69359e7 in __gnu_cxx::new_allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >::allocate(unsigned long, void const*) /usr/include/c++/11/ext/new_allocator.h:121
+          #2 0x5566a69359e7 in std::allocator_traits<std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >::allocate(std::allocator<std::__c...
 Test PIPE13: passed
+    sanitizer reports errors:
+      =================================================================
+      ==1065252==ERROR: LeakSanitizer: detected memory leaks
+
+      Direct leak of 128 byte(s) in 1 object(s) allocated from:
+          #0 0x7f78d36125a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
+          #1 0x55cb874399b1 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:385
+
+      Indirect leak of 112 byte(s) in 1 object(s) allocated from:
+          #0 0x7f78d36125a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
+          #1 0x55cb87438cc0 in parse_line(char const*) /home/mark/github/msh/pset5/msh.cc:287
+
+      Indirect leak of 64 byte(s) in 1 object(s) allocated from:
+          #0 0x7f78d36125a7 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:99
+          #1 0x55cb8744c9e7 in __gnu_cxx::new_allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >::allocate(unsigned long, void const*) /usr/include/c++/11/ext/new_allocator.h:121
+          #2 0x55cb8744c9e7 in std::allocator_traits<std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >::allocate(std::allocator<std::__c...
 Test PIPE14: FAILED in 2.101 sec
     Checking for pipelines, background
     Command  `../msh -q cmdPIPE14.sh &`
@@ -188,7 +174,7 @@ Test PIPE14: FAILED in 2.101 sec
   timeout after 2.00s
     sanitizer reports errors:
       =================================================================
-      ==810826==ERROR: AddressSanitizer: heap-use-after-free on address 0x604000000078 at pc 0x5598c8d2413d bp 0x7ffd8fa7dd50 sp 0x7ffd8fa7dd40
+      ==1065264==ERROR: AddressSanitizer: heap-use-after-free on address 0x604000000078 at pc 0x55fb2a1ad02d bp 0x7ffebfca69a0 sp 0x7ffebfca6990
       READ of size 8 at 0x604000000078 thread T0
       1
 Test PIPE15: passed
@@ -200,23 +186,23 @@ Test PIPE20: passed
 Test PIPE21: passed
 Test PIPE22: passed
 Test PIPE23: passed
-Test PIPE24: passed
+Test PIPE24: FAILED in 10.207 sec
+    Checking for pipeline and background
+    Command  `sleep 0.2 | wc -c | sed s/0/Second/ & sleep 0.1 | wc -c | sed s/0/First/`
+    Output   `First Second`
+  timeout after 10.00s
+    sanitizer reports errors:
+      =================================================================
+      ==1065431==ERROR: AddressSanitizer: heap-use-after-free on address 0x6040000000f8 at pc 0x55f7c45a202d bp 0x7ffdc9f28ea0 sp 0x7ffdc9f28e90
+      READ of size 8 at 0x6040000000f8 thread T0
 Test ZOMBIE1: passed
 Test ZOMBIE2: passed
 Test REDIR1: passed
 Test REDIR2: passed
-Test REDIR3: FAILED in 10.205 sec
-    Checking for redirection and pipeline
-    Command  `cat unwanted.txt | cat < wanted.txt`
-    Output   `Wanted`
-  timeout after 10.00s
+Test REDIR3: passed
 Test REDIR4: passed
 Test REDIR5: passed
-Test REDIR6: FAILED in 10.205 sec
-    Checking for redirection overriding pipeline
-    Command  `echo Ignored | cat < lower.txt | tr A-Z a-z`
-    Output   `lower`
-  timeout after 10.00s
+Test REDIR6: passed
 Test REDIR7: passed
 Test REDIR8: passed
 Test REDIR9: passed
@@ -241,9 +227,9 @@ Test INTR1: passed
 Test INTR2: passed
 Test INTR3: passed
 Test INTR4: passed
-Test INTR5: FAILED in 0.333 sec
+Test INTR5: FAILED in 0.332 sec
     Checking for interrupt not stopping background
     Command  `sleep 0.2 && echo yes & sleep 0.1 && echo no`
     Expected `yes`
-    Got      `[32mmark@ubuntu[0m:[34m~/github/msh/pset5/out[0m% 811270 yes no`
-73 of 89 tests passed
+    Got      `[32mmark@ubuntu[0m:[34m~/github/msh/pset5/out[0m% 1065771 yes no`
+75 of 89 tests passed

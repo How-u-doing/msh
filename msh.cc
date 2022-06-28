@@ -32,7 +32,7 @@ using namespace std;
 #define RUNNING     0
 #define STOPPED     1
 #define COMPLETED   2
-#define TERMINATED  3
+#define TERMINATED  3  // signaled, i.e. terminated by some signal
 
 // a simple command, e.g. grep test > tmp (<) Makefile
 struct Command {
@@ -112,15 +112,6 @@ struct List {
 
 const char* state_strings[] = { "Running", "Stopped", "Done", "Terminated" };
 
-pid_t last_process_in_job(job* j)
-{
-    for (process* p = j->first_cmd; p; p = p->next) {
-        if (!p->next)
-            return p->pid;
-    }
-    return 0; // not found
-}
-
 int find_job_in_stopped_or_bg_jobs(job* j)
 {
     for (const auto& x : stopped_or_bg_jobs) {
@@ -142,20 +133,10 @@ job* find_job(pid_t pid)
     return nullptr;
 }
 
-// do all processes in job `j` have either completed or stopped
-bool job_stopped(job* j)
-{
-    for (process* p = j->first_cmd; p; p = p->next) {
-        if (p->state != COMPLETED && p->state != STOPPED)
-            return false;
-    }
-    return true;
-}
-
 bool job_in_state(job* j, int state)
 {
     for (process* p = j->first_cmd; p; p = p->next) {
-        if (p->state != state)
+        if (p->state != COMPLETED && p->state != state)
             return false;
     }
     return true;
@@ -1067,44 +1048,48 @@ void sigchld_handler(int sig)
     int old_errno = errno;
     int wstatus;
     pid_t pid;
-    while ((pid = waitpid(-1, &wstatus, WUNTRACED | WCONTINUED)) > 0) {
+    while ((pid = waitpid(-1, &wstatus, WNOHANG | WUNTRACED)) > 0) {
         job* j = find_job(pid);
         assert(j);
+        process* waited_process = process_list[pid];
         if (WIFEXITED(wstatus)) {
-            if (pid == last_process_in_job(j)) {
+            if (!waited_process->next) { // the last process in the job
                 last_executed_job_status = WEXITSTATUS(wstatus);
             }
-            process_list[pid]->state = COMPLETED;
+            waited_process->state = COMPLETED;
             if (job_in_state(j, COMPLETED)) {
                 j->state = COMPLETED;
                 break;
             }
         }
         else if (WIFSIGNALED(wstatus)) {
-            process_list[pid]->state = TERMINATED;
-            if (job_in_state(j, TERMINATED))
+            if (!waited_process->next) {
+                last_executed_job_status = WTERMSIG(wstatus);
+                // don't notify interrupted jobs to the user
+                if (last_executed_job_status != SIGINT)
+                    j->notified = false;
+            }
+            waited_process->state = TERMINATED;
+            if (job_in_state(j, TERMINATED)) {
                 j->state = TERMINATED;
-            last_executed_job_status = WTERMSIG(wstatus);
-            if (last_executed_job_status != SIGINT)
-                j->notified = false; // don't notify interrupted jobs to the user
-            break;
+                break;
+            }
         }
         else if (WIFSTOPPED(wstatus)) {
-            int job_index = find_job_in_stopped_or_bg_jobs(j);
-            if (job_index == 0) { // not found
-                job_index = stopped_or_bg_jobs.empty() ?
-                            1 : stopped_or_bg_jobs.rbegin()->first + 1;
-                stopped_or_bg_jobs[job_index] = j;
+            if (!waited_process->next) {
+                last_executed_job_status = WSTOPSIG(wstatus);
+                int job_index = find_job_in_stopped_or_bg_jobs(j);
+                if (job_index == 0) { // not found
+                    job_index = stopped_or_bg_jobs.empty() ?
+                        1 : stopped_or_bg_jobs.rbegin()->first + 1;
+                    stopped_or_bg_jobs[job_index] = j;
+                }
             }
-            process_list[pid]->state = STOPPED;
+            waited_process->state = STOPPED;
             if (job_in_state(j, STOPPED)) {
                 j->state = STOPPED;
-                last_executed_job_status = WSTOPSIG(wstatus);
+                break;
             }
-            break;
-        }
-        else if (WIFCONTINUED(wstatus)) {
-            break;
         }
     }
     errno = old_errno;
