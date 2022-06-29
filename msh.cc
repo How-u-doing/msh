@@ -1039,7 +1039,11 @@ void run_list_of_jobs(job* j)
 
     for (job* skip : skipped_jobs)
         release_job(skip);
+
+    sigset_t oldset;
+    block_all_signals(&oldset);
     delete_finished_jobs();
+    sigprocmask(SIG_SETMASK, &oldset, nullptr);
 }
 
 void sigchld_handler(int sig)
