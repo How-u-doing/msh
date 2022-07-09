@@ -312,7 +312,7 @@ job* parse_line(const char* s)
                 }
                 ccur->redirections.emplace_back(REDIRECT_OP_INPUT, it.str());
             }
-            if (op == ">" || op == "&>" || op == ">&") {
+            else if (op == ">" || op == "&>" || op == ">&") {
                 if (it.type() != TYPE_NORMAL) {
                     string msg = "expected an output file after " + op;
                     msh_error(msg.c_str());
@@ -334,7 +334,7 @@ job* parse_line(const char* s)
                 ccur->redirections.emplace_back(REDIRECT_OP_ERROUT, it.str());
             }
             // >> logfile 2>&1  <==>  &>> logfile
-            if (op == ">>" || op == "&>>" || op == ">>&") {
+            else if (op == ">>" || op == "&>>" || op == ">>&") {
                 if (it.type() != TYPE_NORMAL) {
                     string msg = "expected an output file for appending after " + op;
                     msh_error(msg.c_str());
