@@ -28,6 +28,7 @@ using namespace std;
 #define REDIRECT_OP_ERROUT  2   // 2>
 #define REDIRECT_OP_APPEND  3   // >>
 #define REDIRECT_OP_ERRAPP  4   // 2>>
+#define REDIRECT_OP_ERR2OUT 5   // 2>&1
 
 #define RUNNING     0
 #define STOPPED     1
@@ -298,9 +299,10 @@ job* parse_line(const char* s)
         case TYPE_REDIRECT_OP:
             op = it.str();
             ccur->str += ' ' + op;
-            if (op == "2>&1") {
-                // redirect stderr to stdout
+            if (op == "2>&1") { // without operand
+                // redirect stderr to where stdout (fd 1) is referring to
                 ccur->errfd = STDOUT_FILENO;
+                ccur->redirections.emplace_back(REDIRECT_OP_ERR2OUT, "");
                 break;
             }
             ++it;
@@ -319,11 +321,12 @@ job* parse_line(const char* s)
                     release_cmdline(chead);
                     return nullptr;
                 }
-                // > outfile 2>&1  <==>  &> outfile
-                // the left op is preferred
-                if (op == "&>" || op == ">&") // redirect stderr to stdout
-                    ccur->errfd = STDOUT_FILENO;
+                // &> outfile  <==>  > outfile 2>&1
                 ccur->redirections.emplace_back(REDIRECT_OP_OUTPUT, it.str());
+                if (op != ">") { // &> or >&
+                    ccur->errfd = STDOUT_FILENO;
+                    ccur->redirections.emplace_back(REDIRECT_OP_ERR2OUT, "");
+                }
             }
             else if (op == "2>") {
                 if (it.type() != TYPE_NORMAL) {
@@ -333,7 +336,6 @@ job* parse_line(const char* s)
                 }
                 ccur->redirections.emplace_back(REDIRECT_OP_ERROUT, it.str());
             }
-            // >> logfile 2>&1  <==>  &>> logfile
             else if (op == ">>" || op == "&>>" || op == ">>&") {
                 if (it.type() != TYPE_NORMAL) {
                     string msg = "expected an output file for appending after " + op;
@@ -341,9 +343,12 @@ job* parse_line(const char* s)
                     release_cmdline(chead);
                     return nullptr;
                 }
-                if (op == "&>>" || op == ">>&")
-                    ccur->errfd = STDOUT_FILENO;
+                // &>> outfile  <==>  >> outfile 2>&1
                 ccur->redirections.emplace_back(REDIRECT_OP_APPEND, it.str());
+                if (op != ">>") { // &>> or >>&
+                    ccur->errfd = STDOUT_FILENO;
+                    ccur->redirections.emplace_back(REDIRECT_OP_ERR2OUT, "");
+                }
             }
             else if (op == "2>>") {
                 if (it.type() != TYPE_NORMAL) {
@@ -370,8 +375,10 @@ job* parse_line(const char* s)
                 release_cmdline(chead);
                 return nullptr;
             }
-            if (it.type() == TYPE_PIPE && it.str() == "|&")
+            if (it.type() == TYPE_PIPE && it.str() == "|&") {
                 ccur->errfd = STDOUT_FILENO;
+                ccur->redirections.emplace_back(REDIRECT_OP_ERR2OUT, "");
+            }
             clast = ccur;
             clast->op = it.type();
             ccur = nullptr;
@@ -648,10 +655,28 @@ bool can_exit()
     return true;
 }
 
-void set_up_redirections(Command* cmd)
+void set_up_pipes_and_redirections(Command* cmd)
 {
-    // open redirection files if any
+    // note that pipes are set up before redirections
+
+    // set up pipes (process i/o), if any
+    if (cmd->infd != 0) {  // stdin reads from a pipe read end
+        dup2(cmd->infd, STDIN_FILENO);
+        close(cmd->infd);
+    }
+    if (cmd->outfd != 1) { // stdout writes to a pipe write end
+        dup2(cmd->outfd, STDOUT_FILENO);
+        close(cmd->outfd);
+    }
+
+    // set up redirections, if any
     for (const auto& x : cmd->redirections) {
+        // 2>&1, redirect stderr to where stdout is referring to
+        if (x.first == REDIRECT_OP_ERR2OUT) {
+            dup2(cmd->errfd, STDERR_FILENO); // dup2(1, 2);
+            continue; // no file to open
+        }
+
         // O_CLOEXEC flag permits a program to avoid additional
         // fcntl(2) F_SETFD operations to set the FD_CLOEXEC flag.
         int flags = cmd->pid == 0 ? 0 : O_CLOEXEC;
@@ -670,29 +695,45 @@ void set_up_redirections(Command* cmd)
                 _exit(EXIT_FAILURE);
         }
 
-        // redirect
-        if (x.first == REDIRECT_OP_INPUT)
-            cmd->infd = fd;
-        else if (x.first == REDIRECT_OP_OUTPUT || x.first == REDIRECT_OP_APPEND)
-            cmd->outfd = fd;
-        else if (x.first == REDIRECT_OP_ERROUT || x.first == REDIRECT_OP_ERRAPP)
-            cmd->errfd = fd;
-    }
+        /* Note that
+         *     cmd > out 2>&1
+         * differs from
+         *     cmd 2>&1 > out
+         * The 1st redirects both stdout and stderr to the file `out` (first
+         * redirects stdout to the file and then redirects stderr to where
+         * stdout now has been tied to, i.e. where fd 1 is pointing to);
+         * whereas the 2nd first redirects stderr to the file which fd 1
+         * was pointing to (not necessarily the stdout file stream, may be
+         * a pipe), then redirects stdout to the file `out`.
+         *
+         * The latter can be quite useful if we want to pipe only stderr:
+         *
+         *     cmd 2>&1 > /dev/null | do_something_with_stderr_from_cmd
+         *
+         * So, we need to pay attention to the order in which the operators
+         * 2>&1 and > occur. This order can be determined at parsing phase
+         * by emplacing back the redirections as the parser walks through
+         * the command line from left to right.
+         */
 
-    // set up redirections if any
-    if (cmd->infd != 0) {  // <, redirect a file to stdin
-        dup2(cmd->infd, STDIN_FILENO);
-        close(cmd->infd);
-    }
-    if (cmd->outfd != 1) { // >, redirect stdout to a file
-        dup2(cmd->outfd, STDOUT_FILENO);
-        close(cmd->outfd);
-    }
-    if (cmd->errfd != 2) { // 2>, redirect stderr to a file
-                           // 2>&1, redirect stderr to stdout (&1, fd 1)
-        dup2(cmd->errfd, STDERR_FILENO);
-        if (cmd->errfd != 1)
+        // <, redirect input, stdin reads from file
+        if (x.first == REDIRECT_OP_INPUT) {
+            cmd->infd = fd;
+            dup2(cmd->infd, STDIN_FILENO);
+            close(cmd->infd);
+        }
+        // >/>>, redirect stdout to a file
+        else if (x.first == REDIRECT_OP_OUTPUT || x.first == REDIRECT_OP_APPEND) {
+            cmd->outfd = fd;
+            dup2(cmd->outfd, STDOUT_FILENO);
+            close(cmd->outfd);
+        }
+        // 2>/2>>, redirect stderr to a file
+        else if (x.first == REDIRECT_OP_ERROUT || x.first == REDIRECT_OP_ERRAPP) {
+            cmd->errfd = fd;
+            dup2(cmd->errfd, STDERR_FILENO);
             close(cmd->errfd);
+        }
     }
 }
 
@@ -712,7 +753,7 @@ pid_t run_built_in_cmd(Command* cmd)
     int saved_errfd = dup(2);
     cmd->pid = 0;
     // can only be set once, child processes MUST NOT set it again
-    set_up_redirections(cmd);
+    set_up_pipes_and_redirections(cmd);
 
     if (cmd_name == "exit") {
         if (can_exit()) {
@@ -849,7 +890,7 @@ pid_t run_command(Command* cmd, pid_t pgid, bool foreground)
             signal(SIGQUIT, SIG_DFL);
         }
 
-        set_up_redirections(cmd);
+        set_up_pipes_and_redirections(cmd);
 
         // run a forked built-in command or execvp one
         if (cmd_name == "pwd") {
@@ -872,8 +913,9 @@ void run_pipeline(Pipeline* pipeline)
 {
     // e.g. a | b | c | d
     // |& form (e.g. a |& b or a 2>&1 | b) will be preprocessed in the parsing
-    // phase by setting errfd = 1 (instead of stderr, 2) which then will be
-    // redirected to stdout which will be redirected to some file descriptor.
+    // phase by setting errfd = 1 (instead of stderr, 2), and then stderr will
+    // be redirected to where stdout (fd 1) is pointing to (that is, the write
+    // end of the pipe).
     sigset_t oldset;
     block_chld_signal(&oldset);
 
