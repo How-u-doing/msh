@@ -444,6 +444,7 @@ void block_all_signals(sigset_t* oldset)
 void block_chld_signal(sigset_t* oldset)
 {
     sigset_t mask;
+    sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD);
     sigprocmask(SIG_BLOCK, &mask, oldset);
 }
@@ -451,6 +452,7 @@ void block_chld_signal(sigset_t* oldset)
 void unblock_chld_signal()
 {
     sigset_t mask;
+    sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD);
     sigprocmask(SIG_UNBLOCK, &mask, nullptr);
 }
@@ -933,7 +935,7 @@ void run_pipeline(Pipeline* pipeline)
         }
         run_command(cmd, pipeline->pgid, pipeline->foreground);
         // add all child processes in pipeline to the same process group
-        /* Note that here are race conditions (child processes may `execvp`
+        /* Note that there are race conditions (child processes may `execvp`
          * before parent `setpgid` or may not; ditto `claim_foreground`).
          * """
          * In order to avoid some race conditions, you should call setpgid in
@@ -1031,7 +1033,6 @@ void run_list_of_jobs(job* j)
         if (!j->last) { // not the last pipeline in a conditional
             sigset_t oldset;
             block_chld_signal(&oldset);
-
 #if 1
             /*
              * In fish shell, `sleep 10 && echo foo &` is parsed as running
@@ -1052,7 +1053,7 @@ void run_list_of_jobs(job* j)
              */
             wait_for_job(j, &oldset);
 #else
-            // wait the job in a conditional chain in background
+            // wait for the job in a conditional chain in background
             if (!j->foreground) {
                 // to be implemented...
             }
