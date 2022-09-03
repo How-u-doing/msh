@@ -1237,19 +1237,31 @@ int main(int argc, char* argv[])
 
     char buf[BUFSIZ];
     int bufpos = 0;
-    while (!feof(command_file) || !can_exit()) {
+    while (true) {
         print_prompt();
 
         // read a string, checking for error or EOF
         if (fgets(&buf[bufpos], BUFSIZ - bufpos, command_file) == nullptr) {
-            if (ferror(command_file) && errno == EINTR) {
+            if (ferror(command_file)) {
                 // ignore EINTR errors
-                clearerr(command_file);
-                buf[bufpos] = 0;
-            } else {
-                if (ferror(command_file))
-                    perror("ferror");
-                break;
+                if (errno == EINTR) {
+                    clearerr(command_file);
+                    buf[bufpos] = 0;
+                    continue;
+                }
+                else {
+                    perror("fgets");
+                    break;
+                }
+            }
+            if (feof(command_file)) {
+                cout << "exit\n";
+                if (can_exit()) // clean resources before exiting
+                    break;
+                else {
+                    clearerr(command_file);
+                    continue;
+                }
             }
         }
 
@@ -1261,11 +1273,8 @@ int main(int argc, char* argv[])
             }
             bufpos = 0;
         }
-
-        // handle zombie processes and/or interrupt requests
     }
 
-    cout << "exit" << endl;
     return 0;
 }
 
@@ -1304,7 +1313,7 @@ int main(int argc, char* argv[])
     int bufpos = 0;
     bool needprompt = true;
 
-    while (!feof(command_file) || !can_exit()) {
+    while (true) {
         // Print the prompt at the beginning of the line
         if (needprompt && !quiet) {
             printf("sh61[%d]$ ", getpid());
@@ -1314,15 +1323,25 @@ int main(int argc, char* argv[])
 
         // Read a string, checking for error or EOF
         if (fgets(&buf[bufpos], BUFSIZ - bufpos, command_file) == nullptr) {
-            if (ferror(command_file) && errno == EINTR) {
+            if (ferror(command_file)) {
                 // ignore EINTR errors
-                clearerr(command_file);
-                buf[bufpos] = 0;
-            } else {
-                if (ferror(command_file)) {
-                    perror("sh61");
+                if (errno == EINTR) {
+                    clearerr(command_file);
+                    buf[bufpos] = 0;
+                    continue;
                 }
-                break;
+                else {
+                    perror("fgets");
+                    break;
+                }
+            }
+            if (feof(command_file)) {
+                if (can_exit()) // clean resources before exiting
+                    break;
+                else {
+                    clearerr(command_file);
+                    continue;
+                }
             }
         }
 
@@ -1335,9 +1354,6 @@ int main(int argc, char* argv[])
             bufpos = 0;
             needprompt = 1;
         }
-
-        // Handle zombie processes and/or interrupt requests
-        // Your code here!
     }
 
     return 0;

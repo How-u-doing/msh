@@ -7,4 +7,4 @@ CS 61 Problem Set 5
 make SAN=1 LSAN=1 check
 ```
 
-Currently (Jun. 29, 2022), passed 75/89.
+Currently (Sep. 3, 2022), passed 83/89.
